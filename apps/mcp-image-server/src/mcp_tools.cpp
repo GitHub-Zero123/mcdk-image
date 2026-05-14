@@ -250,12 +250,61 @@ ImageEditRequest parse_edit_request(const Json& params, const AppConfig& config)
 
 Json shared_processing_properties() {
     return {
-        {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
-        {"chromaKey", {{"type", "object"}, {"description", "Remove a guided solid-color chroma screen background into real alpha. Defaults to RGB(0,255,0), but the key color is configurable via r,g,b and should be chosen to avoid conflicts with the asset's dominant palette and translucent edge colors. Fields: enabled,r,g,b,tolerance,softness,spillSuppression."}}},
-        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
-        {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
-        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
-        {"removeFakeTransparency", {{"type", "object"}, {"description", "Legacy border-color cleanup. Prefer chromaKey for new transparent-background workflows."}}}
+        {"enabled", {
+            {"type", "boolean"},
+            {"description", "Enable the post-processing pipeline. Set true when using chromaKey, nearestResize, transparentDomainScale, pixelArtCompress, or removeFakeTransparency."}
+        }},
+        {"chromaKey", {
+            {"type", "object"},
+            {"description", "Remove a guided solid-color chroma screen background into real alpha. Exact supported fields: enabled:boolean, r:number, g:number, b:number, tolerance:number, softness:number, spillSuppression:number. Defaults to RGB(0,255,0). Choose a key color that does not appear in the asset. spillSuppression is numeric strength, not boolean."},
+            {"properties", {
+                {"enabled", {{"type", "boolean"}, {"description", "Enable chroma-key removal."}}},
+                {"r", {{"type", "number"}, {"description", "Chroma key red channel, 0-255. Default 0."}}},
+                {"g", {{"type", "number"}, {"description", "Chroma key green channel, 0-255. Default 255."}}},
+                {"b", {{"type", "number"}, {"description", "Chroma key blue channel, 0-255. Default 0."}}},
+                {"tolerance", {{"type", "number"}, {"description", "Hard removal tolerance. Default 72."}}},
+                {"softness", {{"type", "number"}, {"description", "Soft edge tolerance. Default 32."}}},
+                {"spillSuppression", {{"type", "number"}, {"description", "Color spill suppression strength. Default 48. Use a number, not true/false."}}}
+            }}
+        }},
+        {"nearestResize", {
+            {"type", "object"},
+            {"description", "Nearest-neighbor resize options. Exact supported fields: enabled:boolean, targetWidth:number, targetHeight:number. IMPORTANT: use targetWidth/targetHeight; width/height are ignored. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced."},
+            {"properties", {
+                {"enabled", {{"type", "boolean"}, {"description", "Enable nearest-neighbor resizing."}}},
+                {"targetWidth", {{"type", "number"}, {"description", "Required positive output width when enabled, e.g. 16, 32, 64, or 128. Do not use width."}}},
+                {"targetHeight", {{"type", "number"}, {"description", "Required positive output height when enabled, e.g. 16, 32, 64, or 128. Do not use height."}}}
+            }}
+        }},
+        {"transparentDomainScale", {
+            {"type", "object"},
+            {"description", "Crop the non-transparent alpha domain, add padding, and fit it into a target canvas. Exact supported fields: enabled:boolean, padding:number, targetWidth:number, targetHeight:number, alphaThreshold:number. Use targetWidth/targetHeight; width/height are ignored."},
+            {"properties", {
+                {"enabled", {{"type", "boolean"}, {"description", "Enable transparent-domain crop and scale."}}},
+                {"padding", {{"type", "number"}, {"description", "Transparent padding in output pixels. Default 0."}}},
+                {"targetWidth", {{"type", "number"}, {"description", "Required positive output canvas width when enabled, e.g. 32."}}},
+                {"targetHeight", {{"type", "number"}, {"description", "Required positive output canvas height when enabled, e.g. 32."}}},
+                {"alphaThreshold", {{"type", "number"}, {"description", "Minimum alpha treated as non-transparent for cropping. Default 1."}}}
+            }}
+        }},
+        {"pixelArtCompress", {
+            {"type", "object"},
+            {"description", "Pixel-art compression/downsampling options. Exact supported fields: enabled:boolean, maxWidth:number, maxHeight:number. IMPORTANT: use maxWidth/maxHeight; targetSize, targetWidth, and targetHeight are ignored for this option. Prefer 16x16 or 32x32 for most Minecraft assets."},
+            {"properties", {
+                {"enabled", {{"type", "boolean"}, {"description", "Enable pixel-art compression."}}},
+                {"maxWidth", {{"type", "number"}, {"description", "Maximum output width when enabled, e.g. 16, 32, 64, or 128. Do not use targetSize."}}},
+                {"maxHeight", {{"type", "number"}, {"description", "Maximum output height when enabled, e.g. 16, 32, 64, or 128. Do not use targetSize."}}}
+            }}
+        }},
+        {"removeFakeTransparency", {
+            {"type", "object"},
+            {"description", "Legacy border-color cleanup. Prefer chromaKey for new transparent-background workflows. Exact supported fields: enabled:boolean, tolerance:number, alpha:number."},
+            {"properties", {
+                {"enabled", {{"type", "boolean"}, {"description", "Enable legacy fake-transparency cleanup."}}},
+                {"tolerance", {{"type", "number"}, {"description", "Border-color match tolerance. Default 16."}}},
+                {"alpha", {{"type", "number"}, {"description", "Alpha value assigned to removed pixels. Default 0."}}}
+            }}
+        }}
     };
 }
 
