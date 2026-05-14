@@ -3,6 +3,7 @@ add_executable(mcdk-image-server
     src/app_config.cpp
     src/http_client.cpp
     src/openai_image_provider.cpp
+    src/sdcpp_image_provider.cpp
     src/image_processor.cpp
     src/mcp_tools.cpp
 )
@@ -18,6 +19,11 @@ target_link_libraries(mcdk-image-server PRIVATE
     mcp
     nlohmann_json::nlohmann_json
 )
+
+if(TARGET stable-diffusion)
+    target_link_libraries(mcdk-image-server PRIVATE stable-diffusion)
+    target_compile_definitions(mcdk-image-server PRIVATE MCDK_IMAGE_HAS_SDCPP=1)
+endif()
 
 if(WIN32)
     target_link_libraries(mcdk-image-server PRIVATE winhttp)

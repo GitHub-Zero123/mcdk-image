@@ -2,6 +2,7 @@
 
 #include "image_processor.hpp"
 #include "openai_image_provider.hpp"
+#include "sdcpp_image_provider.hpp"
 
 #include "mcp_message.h"
 #include "mcp_tool.h"
@@ -431,6 +432,10 @@ bool image_too_large_for_base64(const ImageData& image, int max_dimension = 128)
     }
 }
 
+std::string provider_display_name(const AppConfig& config) {
+    return (config.protocol == "sdcpp" || config.protocol == "stable-diffusion.cpp") ? "sdcpp" : config.protocol;
+}
+
 Json handle_generate_image(const Json& params, const AppConfig& config) {
     const auto started = std::chrono::steady_clock::now();
     const std::string job_id = make_job_id();
@@ -439,19 +444,27 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
     const bool self_review_hint = bool_param(params, "selfReviewHint", true);
     const bool needs_final_png = return_base64 || self_review_hint || save_to_file;
 
-    OpenAIImageProvider provider(config);
+    std::unique_ptr<ImageProvider> provider;
+    if (config.protocol == "sdcpp" || config.protocol == "stable-diffusion.cpp") {
+        provider = std::make_unique<StableDiffusionCppProvider>(config);
+    } else {
+        provider = std::make_unique<OpenAIImageProvider>(config);
+    }
     ImageGenerationRequest request = parse_generation_request(params, config);
     ImageProcessingOptions processing = parse_processing_options(params);
     request.prompt = chroma_key_prompt(minecraft_asset_prompt(request.prompt), processing);
     processing.force_png_output = needs_final_png || request.native_transparency || processing.chroma_key_enabled;
-    ImageGenerationResult generated = provider.generate(request);
+    ImageGenerationResult generated = provider->generate(request);
 
     Json metadata = Json::object();
     metadata["jobId"] = job_id;
-    metadata["provider"] = config.protocol;
+    metadata["provider"] = provider_display_name(config);
     metadata["model"] = request.model;
     metadata["nativeTransparency"] = request.native_transparency;
     metadata["transparencyWorkflow"] = processing.chroma_key_enabled ? "chroma_key_green_screen" : (request.native_transparency ? "native_provider_alpha_requested" : "none");
+    if (provider_display_name(config) == "sdcpp") {
+        metadata["sdcpp"] = generated.raw_response;
+    }
     metadata["images"] = Json::array();
 
     std::vector<CachedImage> cache_entry;
@@ -614,6 +627,13 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
     const bool self_review_hint = bool_param(params, "selfReviewHint", true);
     const bool needs_final_png = return_base64 || self_review_hint || save_to_file;
 
+    if (config.protocol == "sdcpp" || config.protocol == "stable-diffusion.cpp") {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            "edit_image is not supported by the stable-diffusion.cpp provider yet; use generate_image or switch MCDK_IMAGE_PROTOCOL=openai"
+        );
+    }
+
     OpenAIImageProvider provider(config);
     ImageEditRequest request = parse_edit_request(params, config);
     ImageProcessingOptions processing = parse_processing_options(params);
@@ -623,7 +643,7 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
 
     Json metadata = Json::object();
     metadata["jobId"] = job_id;
-    metadata["provider"] = config.protocol;
+    metadata["provider"] = provider_display_name(config);
     metadata["model"] = request.model;
     metadata["nativeTransparency"] = request.native_transparency;
     metadata["transparencyWorkflow"] = processing.chroma_key_enabled ? "chroma_key_green_screen" : (request.native_transparency ? "native_provider_alpha_requested" : "none");
