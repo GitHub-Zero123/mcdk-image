@@ -242,7 +242,7 @@ Provider 连接配置只允许通过环境变量传递，不允许从 MCP tool �
 MCDK_IMAGE_PROTOCOL=openai
 MCDK_IMAGE_BASE_URL=https://api.openai.com
 MCDK_IMAGE_API_KEY=...
-MCDK_IMAGE_DEFAULT_MODEL=gpt-image-1
+MCDK_IMAGE_DEFAULT_MODEL=gpt-image-2
 MCDK_IMAGE_TIMEOUT_SECONDS=400
 ```
 

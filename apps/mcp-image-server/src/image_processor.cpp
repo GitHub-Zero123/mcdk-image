@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -156,6 +157,17 @@ ImageProcessingOptions parse_processing_options(const Json& params) {
         options.pixel_art_max_height = json_int_or(pixel, "maxHeight", 0);
     }
 
+    if (processing.contains("chromaKey") && processing["chromaKey"].is_object()) {
+        const Json& chroma = processing["chromaKey"];
+        options.chroma_key_enabled = json_bool_or(chroma, "enabled", false);
+        options.chroma_key_r = json_int_or(chroma, "r", 0);
+        options.chroma_key_g = json_int_or(chroma, "g", 255);
+        options.chroma_key_b = json_int_or(chroma, "b", 0);
+        options.chroma_key_tolerance = json_int_or(chroma, "tolerance", 72);
+        options.chroma_key_softness = json_int_or(chroma, "softness", 32);
+        options.chroma_key_spill_suppression = json_int_or(chroma, "spillSuppression", 48);
+    }
+
     if (processing.contains("removeFakeTransparency") && processing["removeFakeTransparency"].is_object()) {
         const Json& fake = processing["removeFakeTransparency"];
         options.remove_fake_transparency_enabled = json_bool_or(fake, "enabled", false);
@@ -226,6 +238,34 @@ ImageBuffer nearest_resize(const ImageBuffer& source, int target_width, int targ
     return output;
 }
 
+ImageBuffer paste_center_rgba(const ImageBuffer& foreground, int target_width, int target_height) {
+    ImageBuffer output;
+    output.width = target_width;
+    output.height = target_height;
+    output.rgba.assign(static_cast<std::size_t>(target_width) * static_cast<std::size_t>(target_height) * 4, 0);
+
+    const int offset_x = std::max(0, (target_width - foreground.width) / 2);
+    const int offset_y = std::max(0, (target_height - foreground.height) / 2);
+    for (int y = 0; y < foreground.height && y + offset_y < target_height; ++y) {
+        for (int x = 0; x < foreground.width && x + offset_x < target_width; ++x) {
+            const std::size_t src = (static_cast<std::size_t>(y) * foreground.width + x) * 4;
+            const std::size_t dst = (static_cast<std::size_t>(y + offset_y) * target_width + (x + offset_x)) * 4;
+            std::copy_n(foreground.rgba.begin() + static_cast<std::ptrdiff_t>(src), 4, output.rgba.begin() + static_cast<std::ptrdiff_t>(dst));
+        }
+    }
+    return output;
+}
+
+ImageBuffer fit_resize_preserve_aspect(const ImageBuffer& source, int target_width, int target_height) {
+    const double scale_x = static_cast<double>(target_width) / static_cast<double>(source.width);
+    const double scale_y = static_cast<double>(target_height) / static_cast<double>(source.height);
+    const double scale = std::min(scale_x, scale_y);
+    const int fit_width = std::max(1, static_cast<int>(source.width * scale));
+    const int fit_height = std::max(1, static_cast<int>(source.height * scale));
+    ImageBuffer resized = nearest_resize(source, fit_width, fit_height);
+    return paste_center_rgba(resized, target_width, target_height);
+}
+
 ImageBuffer transparent_domain_scale(const ImageBuffer& source, int target_width, int target_height, int padding, int alpha_threshold) {
     if (target_width <= 0 || target_height <= 0) {
         throw std::runtime_error("image_process_error: transparentDomainScale target size must be positive");
@@ -260,7 +300,7 @@ ImageBuffer transparent_domain_scale(const ImageBuffer& source, int target_width
     bottom = std::min(source.height - 1, bottom + pad);
 
     ImageBuffer cropped = crop_rgba(source, left, top, right - left + 1, bottom - top + 1);
-    return nearest_resize(cropped, target_width, target_height);
+    return fit_resize_preserve_aspect(cropped, target_width, target_height);
 }
 
 ImageBuffer remove_fake_transparency_background(const ImageBuffer& source, int tolerance, int target_alpha) {
@@ -291,12 +331,87 @@ ImageBuffer remove_fake_transparency_background(const ImageBuffer& source, int t
     return output;
 }
 
+ImageBuffer remove_chroma_key_background(const ImageBuffer& source, int key_r, int key_g, int key_b, int tolerance, int softness, int spill_suppression) {
+    ImageBuffer output = source;
+    const int kr = std::clamp(key_r, 0, 255);
+    const int kg = std::clamp(key_g, 0, 255);
+    const int kb = std::clamp(key_b, 0, 255);
+    const int hard = std::max(0, tolerance);
+    const int soft = std::max(1, softness);
+    const int spill = std::clamp(spill_suppression, 0, 255);
+
+    for (int y = 0; y < output.height; ++y) {
+        for (int x = 0; x < output.width; ++x) {
+            const std::size_t index = (static_cast<std::size_t>(y) * output.width + x) * 4;
+            const int r = output.rgba[index + 0];
+            const int g = output.rgba[index + 1];
+            const int b = output.rgba[index + 2];
+            const int dr = r - kr;
+            const int dg = g - kg;
+            const int db = b - kb;
+            const double distance = std::sqrt(static_cast<double>(dr * dr + dg * dg + db * db));
+
+            double alpha = 1.0;
+            if (distance <= static_cast<double>(hard)) {
+                alpha = 0.0;
+            } else if (distance <= static_cast<double>(hard + soft)) {
+                alpha = (distance - static_cast<double>(hard)) / static_cast<double>(soft);
+            }
+
+            // Pure chroma pixels become transparent. Mixed semi-transparent
+            // pixels keep a fractional alpha and are un-premixed from the green
+            // screen: observed = fg * alpha + key * (1-alpha).
+            if (alpha <= 0.0) {
+                output.rgba[index + 0] = 0;
+                output.rgba[index + 1] = 0;
+                output.rgba[index + 2] = 0;
+                output.rgba[index + 3] = 0;
+                continue;
+            }
+
+            if (alpha < 1.0) {
+                const auto unmix = [&](int observed, int key) {
+                    const double value = (static_cast<double>(observed) - static_cast<double>(key) * (1.0 - alpha)) / alpha;
+                    return static_cast<std::uint8_t>(std::clamp(static_cast<int>(std::round(value)), 0, 255));
+                };
+                output.rgba[index + 0] = unmix(r, kr);
+                output.rgba[index + 1] = unmix(g, kg);
+                output.rgba[index + 2] = unmix(b, kb);
+                output.rgba[index + 3] = static_cast<std::uint8_t>(std::clamp(static_cast<int>(std::round(alpha * 255.0)), 0, 255));
+            }
+
+            const int rr = output.rgba[index + 0];
+            const int gg = output.rgba[index + 1];
+            const int bb = output.rgba[index + 2];
+            if (spill > 0 && gg > rr && gg > bb) {
+                const int max_non_green = std::max(rr, bb);
+                const int excess_green = std::max(0, gg - max_non_green);
+                output.rgba[index + 1] = static_cast<std::uint8_t>(std::max(max_non_green, gg - std::min(excess_green, spill)));
+            }
+        }
+    }
+
+    return output;
+}
+
 ImageData process_image_data(const ImageData& input, const ImageProcessingOptions& options) {
     if (!options.enabled && !options.force_png_output) {
         return input;
     }
 
     ImageBuffer image = decode_image_rgba(input.bytes);
+
+    if (options.chroma_key_enabled) {
+        image = remove_chroma_key_background(
+            image,
+            options.chroma_key_r,
+            options.chroma_key_g,
+            options.chroma_key_b,
+            options.chroma_key_tolerance,
+            options.chroma_key_softness,
+            options.chroma_key_spill_suppression
+        );
+    }
 
     if (options.remove_fake_transparency_enabled) {
         image = remove_fake_transparency_background(
@@ -306,6 +421,7 @@ ImageData process_image_data(const ImageData& input, const ImageProcessingOption
         );
     }
 
+    bool already_resized_to_nearest_target = false;
     if (options.transparent_domain_scale_enabled) {
         image = transparent_domain_scale(
             image,
@@ -314,9 +430,23 @@ ImageData process_image_data(const ImageData& input, const ImageProcessingOption
             options.transparent_padding,
             options.alpha_threshold
         );
+    } else if (options.chroma_key_enabled && options.nearest_resize_enabled && options.nearest_target_width > 0 && options.nearest_target_height > 0) {
+        // Chroma-key workflows create real alpha before resizing. If the caller
+        // only requested a final nearest resize, automatically crop to the
+        // non-transparent domain first so the subject does not stay tiny in the
+        // full green-screen canvas.
+        const int auto_padding = std::max(2, std::min(image.width, image.height) / 64);
+        image = transparent_domain_scale(
+            image,
+            options.nearest_target_width,
+            options.nearest_target_height,
+            auto_padding,
+            std::max(1, options.alpha_threshold)
+        );
+        already_resized_to_nearest_target = true;
     }
 
-    if (options.nearest_resize_enabled) {
+    if (options.nearest_resize_enabled && !already_resized_to_nearest_target) {
         image = nearest_resize(image, options.nearest_target_width, options.nearest_target_height);
     }
 

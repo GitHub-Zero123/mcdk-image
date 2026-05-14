@@ -104,7 +104,7 @@ AppConfig load_app_config(int argc, char** argv) {
     config.protocol = env_or_default("MCDK_IMAGE_PROTOCOL", "openai");
     config.base_url = env_or_default("MCDK_IMAGE_BASE_URL", "");
     config.api_key = env_or_default("MCDK_IMAGE_API_KEY", "");
-    config.default_model = env_or_default("MCDK_IMAGE_DEFAULT_MODEL", "gpt-image-1");
+    config.default_model = env_or_default("MCDK_IMAGE_DEFAULT_MODEL", "gpt-image-2");
     config.log_level = env_or_default("MCDK_IMAGE_LOG_LEVEL", "info");
 
     if (const auto timeout = get_env_string("MCDK_IMAGE_TIMEOUT_SECONDS")) {

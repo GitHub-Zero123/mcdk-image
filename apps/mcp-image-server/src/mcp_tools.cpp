@@ -251,10 +251,11 @@ ImageEditRequest parse_edit_request(const Json& params, const AppConfig& config)
 Json shared_processing_properties() {
     return {
         {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
+        {"chromaKey", {{"type", "object"}, {"description", "Remove a guided solid-color screen background into real alpha. Defaults to pure green RGB(0,255,0). Fields: enabled,r,g,b,tolerance,softness,spillSuppression."}}},
         {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
         {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
         {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
-        {"removeFakeTransparency", {{"type", "object"}, {"description", "Convert fake checkerboard/solid background colors into real alpha transparency"}}}
+        {"removeFakeTransparency", {{"type", "object"}, {"description", "Legacy border-color cleanup. Prefer chromaKey for new transparent-background workflows."}}}
     };
 }
 
@@ -262,14 +263,14 @@ mcp::tool build_generate_image_tool() {
     Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("generate_image")
-        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Default generation size is 1024x1024 because some gateways reject 512x512 with upstream errors; post-process down to 32x32 or 16x16 for most Minecraft pixel-art assets. 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets. Default workflow keeps the image in memory and returns base64 for LLM self-review; only save to file when saveToFile=true after review. Prompts should request a single item/entity/block asset, not a grid, collage, spritesheet, or multiple objects. True transparency/semi-transparency should be requested through nativeTransparency or provider extra fields, not only through prompt wording.")
+        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Models behind sub2api-style gateways usually do not return true native alpha even for PNG, so the recommended transparent workflow is: request a flat pure-green chroma screen via processing.chromaKey.enabled=true, then locally remove that green into alpha. Default generation size is 1024x1024; post-process down to 32x32 or 16x16 for Minecraft assets. Base64 is returned only when the final output is <=128x128; larger images must be saved or downsampled first.")
         .with_string_param("prompt", "Image prompt", true)
         .with_string_param("model", "Image model override for this request", false)
         .with_string_param("size", "Optional provider image size. Defaults to 1024x1024 because some gateways reject 512x512; use smaller sizes only when the provider is known to support them.", false)
         .with_number_param("n", "Number of images, 1-4", false)
         .with_string_param("quality", "Provider quality option", false)
         .with_string_param("style", "Provider style option", false)
-        .with_boolean_param("nativeTransparency", "Request native transparent PNG output through provider parameters. Do not rely on prompt wording alone for transparency/semi-transparency.", false)
+        .with_boolean_param("nativeTransparency", "Request native PNG alpha parameters if the provider supports them. Most tested image models here returned opaque PNG; prefer processing.chromaKey for transparent output.", false)
         .with_object_param("extra", "Extra provider JSON fields, excluding connection config. Use this for provider-specific native alpha/transparency controls.", Json::object(), false)
         .with_object_param("processing", "Optional image processing pipeline", processing_properties, false)
         .with_boolean_param("returnBase64", "Return image base64 in metadata. Defaults to true for in-memory review.", false)
@@ -309,7 +310,7 @@ mcp::tool build_edit_image_tool() {
     Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("edit_image")
-        .with_description("Edit an existing image through the environment-configured OpenAI-compatible image edit endpoint. Input can come from a cached generate_image/edit_image jobId, an absolute UTF-8 inputPath, or inputBase64. Output defaults to in-memory review; saving requires an explicit absolute UTF-8 outputPath. Native alpha-capable PNG output is controlled by nativeTransparency/output_format parameters, not prompt wording.")
+        .with_description("Edit an existing image through the environment-configured OpenAI-compatible image edit endpoint. Input can come from a cached generate_image/edit_image jobId, an absolute UTF-8 inputPath, or inputBase64. For transparent output, prefer processing.chromaKey.enabled=true so the edit is guided onto a flat pure-green screen and then locally keyed to alpha. Base64 is returned only when the final output is <=128x128.")
         .with_string_param("prompt", "Edit instruction prompt", true)
         .with_string_param("model", "Image model override for this request", false)
         .with_string_param("sourceJobId", "Cached source jobId returned by generate_image or edit_image", false)
@@ -320,7 +321,7 @@ mcp::tool build_edit_image_tool() {
         .with_string_param("size", "Optional provider image size. Defaults to 1024x1024 because some gateways reject 512x512; use post-processing to downsample.", false)
         .with_number_param("n", "Number of edited images, 1-4", false)
         .with_string_param("quality", "Provider quality option", false)
-        .with_boolean_param("nativeTransparency", "Request alpha-capable PNG output through provider parameters. Do not rely on prompt wording alone for transparency/semi-transparency.", false)
+        .with_boolean_param("nativeTransparency", "Request native PNG alpha parameters if the provider supports them. Prefer processing.chromaKey for transparent output with tested non-alpha models.", false)
         .with_object_param("extra", "Extra provider JSON fields, excluding connection config. Use this for provider-specific edit parameters.", Json::object(), false)
         .with_object_param("processing", "Optional image processing pipeline", processing_properties, false)
         .with_boolean_param("returnBase64", "Return image base64 in metadata. Defaults to true for in-memory review.", false)
@@ -341,6 +342,25 @@ std::string minecraft_asset_prompt(const std::string& user_prompt) {
           "Keep a clean readable silhouette, centered object, crisp pixel-art edges, and low-noise colors.";
 }
 
+std::string chroma_key_prompt(const std::string& prompt, const ImageProcessingOptions& processing) {
+    if (!processing.chroma_key_enabled) {
+        return prompt;
+    }
+    return prompt
+        + "\n\nChroma-key transparency workflow: render the asset in front of a perfectly flat pure green screen background RGB(0,255,0) / #00FF00. "
+          "The green background must be a single uniform solid color, with no gradients, shadows, texture, border, checkerboard, glow, vignette, ground plane, or environmental lighting on it. "
+          "Keep the object fully separate from the green screen. Avoid green colors inside the asset unless absolutely necessary.";
+}
+
+bool image_too_large_for_base64(const ImageData& image, int max_dimension = 128) {
+    try {
+        ImageBuffer buffer = decode_image_rgba(image.bytes);
+        return buffer.width > max_dimension || buffer.height > max_dimension;
+    } catch (...) {
+        return true;
+    }
+}
+
 Json handle_generate_image(const Json& params, const AppConfig& config) {
     const auto started = std::chrono::steady_clock::now();
     const std::string job_id = make_job_id();
@@ -351,9 +371,9 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
 
     OpenAIImageProvider provider(config);
     ImageGenerationRequest request = parse_generation_request(params, config);
-    request.prompt = minecraft_asset_prompt(request.prompt);
     ImageProcessingOptions processing = parse_processing_options(params);
-    processing.force_png_output = needs_final_png || request.native_transparency;
+    request.prompt = chroma_key_prompt(minecraft_asset_prompt(request.prompt), processing);
+    processing.force_png_output = needs_final_png || request.native_transparency || processing.chroma_key_enabled;
     ImageGenerationResult generated = provider.generate(request);
 
     Json metadata = Json::object();
@@ -361,6 +381,7 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
     metadata["provider"] = config.protocol;
     metadata["model"] = request.model;
     metadata["nativeTransparency"] = request.native_transparency;
+    metadata["transparencyWorkflow"] = processing.chroma_key_enabled ? "chroma_key_green_screen" : (request.native_transparency ? "native_provider_alpha_requested" : "none");
     metadata["images"] = Json::array();
 
     std::vector<CachedImage> cache_entry;
@@ -391,14 +412,20 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
             image_meta["filePath"] = path_to_utf8_string(output_path);
         }
 
-        if (return_base64 || self_review_hint) {
+        const bool base64_blocked_by_size = image_too_large_for_base64(image);
+        if ((return_base64 || self_review_hint) && !base64_blocked_by_size) {
             image_meta["base64"] = base64_encode_bytes(image.bytes);
+        } else if (return_base64 || self_review_hint) {
+            image_meta["base64Rejected"] = "output image exceeds 128x128; save to file or enable processing.nearestResize/pixelArtCompress first";
         }
 
         image_meta["processing"] = {
             {"enabled", processing.enabled},
+            {"chromaKeyApplied", processing.enabled && processing.chroma_key_enabled},
+            {"chromaKeyColor", {processing.chroma_key_r, processing.chroma_key_g, processing.chroma_key_b}},
             {"nearestResizeApplied", processing.enabled && processing.nearest_resize_enabled},
             {"transparentDomainScaleApplied", processing.enabled && processing.transparent_domain_scale_enabled},
+            {"autoTransparentDomainScaleApplied", processing.enabled && processing.chroma_key_enabled && !processing.transparent_domain_scale_enabled && processing.nearest_resize_enabled},
             {"pixelArtCompressApplied", processing.enabled && processing.pixel_art_compress_enabled},
             {"removeFakeTransparencyApplied", processing.enabled && processing.remove_fake_transparency_enabled}
         };
@@ -519,9 +546,9 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
 
     OpenAIImageProvider provider(config);
     ImageEditRequest request = parse_edit_request(params, config);
-    request.prompt = minecraft_asset_prompt(request.prompt);
     ImageProcessingOptions processing = parse_processing_options(params);
-    processing.force_png_output = needs_final_png || request.native_transparency;
+    request.prompt = chroma_key_prompt(minecraft_asset_prompt(request.prompt), processing);
+    processing.force_png_output = needs_final_png || request.native_transparency || processing.chroma_key_enabled;
     ImageGenerationResult edited = provider.edit(request);
 
     Json metadata = Json::object();
@@ -529,6 +556,7 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
     metadata["provider"] = config.protocol;
     metadata["model"] = request.model;
     metadata["nativeTransparency"] = request.native_transparency;
+    metadata["transparencyWorkflow"] = processing.chroma_key_enabled ? "chroma_key_green_screen" : (request.native_transparency ? "native_provider_alpha_requested" : "none");
     metadata["inputImageCount"] = request.input_images.size();
     metadata["images"] = Json::array();
 
@@ -560,14 +588,20 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
             image_meta["filePath"] = path_to_utf8_string(output_path);
         }
 
-        if (return_base64 || self_review_hint) {
+        const bool base64_blocked_by_size = image_too_large_for_base64(image);
+        if ((return_base64 || self_review_hint) && !base64_blocked_by_size) {
             image_meta["base64"] = base64_encode_bytes(image.bytes);
+        } else if (return_base64 || self_review_hint) {
+            image_meta["base64Rejected"] = "output image exceeds 128x128; save to file or enable processing.nearestResize/pixelArtCompress first";
         }
 
         image_meta["processing"] = {
             {"enabled", processing.enabled},
+            {"chromaKeyApplied", processing.enabled && processing.chroma_key_enabled},
+            {"chromaKeyColor", {processing.chroma_key_r, processing.chroma_key_g, processing.chroma_key_b}},
             {"nearestResizeApplied", processing.enabled && processing.nearest_resize_enabled},
             {"transparentDomainScaleApplied", processing.enabled && processing.transparent_domain_scale_enabled},
+            {"autoTransparentDomainScaleApplied", processing.enabled && processing.chroma_key_enabled && !processing.transparent_domain_scale_enabled && processing.nearest_resize_enabled},
             {"pixelArtCompressApplied", processing.enabled && processing.pixel_art_compress_enabled},
             {"removeFakeTransparencyApplied", processing.enabled && processing.remove_fake_transparency_enabled}
         };
