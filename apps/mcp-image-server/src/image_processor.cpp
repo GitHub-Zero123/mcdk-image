@@ -3,10 +3,12 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,6 +40,12 @@ struct PngWriteContext {
     std::vector<std::uint8_t> bytes;
 };
 
+struct RgbColor {
+    std::uint8_t r = 0;
+    std::uint8_t g = 0;
+    std::uint8_t b = 0;
+};
+
 void png_write_callback(void* context, void* data, int size) {
     auto* output = static_cast<PngWriteContext*>(context);
     const auto* begin = static_cast<const std::uint8_t*>(data);
@@ -58,6 +66,60 @@ ImageBuffer crop_rgba(const ImageBuffer& source, int left, int top, int width, i
         }
     }
     return cropped;
+}
+
+std::uint32_t quantized_rgb_key(const ImageBuffer& source, int x, int y) {
+    const std::size_t index = (static_cast<std::size_t>(y) * source.width + x) * 4;
+    const auto r = static_cast<std::uint32_t>(source.rgba[index + 0] & 0xf0);
+    const auto g = static_cast<std::uint32_t>(source.rgba[index + 1] & 0xf0);
+    const auto b = static_cast<std::uint32_t>(source.rgba[index + 2] & 0xf0);
+    return (r << 16) | (g << 8) | b;
+}
+
+RgbColor color_from_key(std::uint32_t key) {
+    return RgbColor{
+        static_cast<std::uint8_t>((key >> 16) & 0xff),
+        static_cast<std::uint8_t>((key >> 8) & 0xff),
+        static_cast<std::uint8_t>(key & 0xff)
+    };
+}
+
+int color_distance(const ImageBuffer& source, std::size_t index, RgbColor color) {
+    return std::abs(static_cast<int>(source.rgba[index + 0]) - static_cast<int>(color.r))
+        + std::abs(static_cast<int>(source.rgba[index + 1]) - static_cast<int>(color.g))
+        + std::abs(static_cast<int>(source.rgba[index + 2]) - static_cast<int>(color.b));
+}
+
+std::vector<RgbColor> detect_border_background_colors(const ImageBuffer& source) {
+    std::map<std::uint32_t, int> histogram;
+
+    for (int x = 0; x < source.width; ++x) {
+        ++histogram[quantized_rgb_key(source, x, 0)];
+        ++histogram[quantized_rgb_key(source, x, source.height - 1)];
+    }
+    for (int y = 0; y < source.height; ++y) {
+        ++histogram[quantized_rgb_key(source, 0, y)];
+        ++histogram[quantized_rgb_key(source, source.width - 1, y)];
+    }
+
+    std::vector<std::pair<int, std::uint32_t>> ranked;
+    ranked.reserve(histogram.size());
+    for (const auto& [key, count] : histogram) {
+        ranked.emplace_back(count, key);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first > rhs.first;
+    });
+
+    std::vector<RgbColor> colors;
+    for (const auto& [count, key] : ranked) {
+        (void)count;
+        colors.push_back(color_from_key(key));
+        if (colors.size() >= 2) {
+            break;
+        }
+    }
+    return colors;
 }
 
 } // namespace
@@ -92,6 +154,13 @@ ImageProcessingOptions parse_processing_options(const Json& params) {
         options.pixel_art_compress_enabled = json_bool_or(pixel, "enabled", false);
         options.pixel_art_max_width = json_int_or(pixel, "maxWidth", 0);
         options.pixel_art_max_height = json_int_or(pixel, "maxHeight", 0);
+    }
+
+    if (processing.contains("removeFakeTransparency") && processing["removeFakeTransparency"].is_object()) {
+        const Json& fake = processing["removeFakeTransparency"];
+        options.remove_fake_transparency_enabled = json_bool_or(fake, "enabled", false);
+        options.fake_transparency_tolerance = json_int_or(fake, "tolerance", 16);
+        options.fake_transparency_alpha = json_int_or(fake, "alpha", 0);
     }
 
     return options;
@@ -194,12 +263,48 @@ ImageBuffer transparent_domain_scale(const ImageBuffer& source, int target_width
     return nearest_resize(cropped, target_width, target_height);
 }
 
+ImageBuffer remove_fake_transparency_background(const ImageBuffer& source, int tolerance, int target_alpha) {
+    ImageBuffer output = source;
+    const std::vector<RgbColor> background_colors = detect_border_background_colors(source);
+    if (background_colors.empty()) {
+        return output;
+    }
+
+    const int threshold = std::max(0, tolerance) * 3;
+    const std::uint8_t alpha = static_cast<std::uint8_t>(std::clamp(target_alpha, 0, 255));
+
+    for (int y = 0; y < output.height; ++y) {
+        for (int x = 0; x < output.width; ++x) {
+            const std::size_t index = (static_cast<std::size_t>(y) * output.width + x) * 4;
+            const bool near_background = std::any_of(background_colors.begin(), background_colors.end(), [&](RgbColor color) {
+                return color_distance(output, index, color) <= threshold;
+            });
+            if (near_background) {
+                output.rgba[index + 0] = 0;
+                output.rgba[index + 1] = 0;
+                output.rgba[index + 2] = 0;
+                output.rgba[index + 3] = alpha;
+            }
+        }
+    }
+
+    return output;
+}
+
 ImageData process_image_data(const ImageData& input, const ImageProcessingOptions& options) {
     if (!options.enabled) {
         return input;
     }
 
     ImageBuffer image = decode_image_rgba(input.bytes);
+
+    if (options.remove_fake_transparency_enabled) {
+        image = remove_fake_transparency_background(
+            image,
+            options.fake_transparency_tolerance,
+            options.fake_transparency_alpha
+        );
+    }
 
     if (options.transparent_domain_scale_enabled) {
         image = transparent_domain_scale(

@@ -19,8 +19,8 @@ target_link_libraries(mcp-image-server PRIVATE
     nlohmann_json::nlohmann_json
 )
 
-if(MCP_SSL)
-    target_compile_definitions(mcp-image-server PRIVATE MCP_SSL CPPHTTPLIB_OPENSSL_SUPPORT)
+if(WIN32)
+    target_link_libraries(mcp-image-server PRIVATE winhttp)
 endif()
 
 if(MSVC)
