@@ -365,8 +365,8 @@ static void print_progress_line(int step, int steps, const std::string& speed_te
     }
     std::string progress = build_progress_bar(step, steps);
     const char* lf       = (step == steps ? "\n" : "");
-    printf("\r%s %i/%i - %s\033[K%s", progress.c_str(), step, steps, speed_text.c_str(), lf);
-    fflush(stdout);  // for linux
+    fprintf(stderr, "\r%s %i/%i - %s\033[K%s", progress.c_str(), step, steps, speed_text.c_str(), lf);
+    fflush(stderr);
 }
 
 void pretty_progress(int step, int steps, float time) {

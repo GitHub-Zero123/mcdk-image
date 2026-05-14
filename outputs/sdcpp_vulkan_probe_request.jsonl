@@ -1,0 +1,3 @@
+﻿{"method":"initialize","params":{"clientInfo":{"version":"0.1","name":"probe"},"protocolVersion":"2024-11-05","capabilities":{}},"id":1,"jsonrpc":"2.0"}
+{"method":"notifications/initialized","params":{},"jsonrpc":"2.0"}
+{"method":"tools/call","params":{"arguments":{"saveToFile":true,"returnBase64":false,"prompt":"a single red cube","outputPath":"D:/Zero123/CPP/CMAKE/mcdk-image/outputs/sdcpp_vulkan_probe.png","extra":{"seed":1,"steps":1},"selfReviewHint":false,"size":"256x256"},"name":"generate_image"},"id":2,"jsonrpc":"2.0"}

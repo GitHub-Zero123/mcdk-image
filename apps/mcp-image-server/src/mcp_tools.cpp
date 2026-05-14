@@ -189,7 +189,10 @@ ImageGenerationRequest parse_generation_request(const Json& params, const AppCon
     ImageGenerationRequest request;
     request.prompt = params["prompt"].get<std::string>();
     request.model = string_param(params, "model").value_or(config.default_model);
-    request.size = string_param(params, "size").value_or("1024x1024");
+    const std::string default_size = (config.protocol == "sdcpp" || config.protocol == "stable-diffusion.cpp")
+        ? config.sdcpp.default_size
+        : "1024x1024";
+    request.size = string_param(params, "size").value_or(default_size);
     request.quality = string_param(params, "quality");
     request.style = string_param(params, "style");
     request.native_transparency = bool_param(params, "nativeTransparency", false);
