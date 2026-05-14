@@ -70,10 +70,11 @@ Json build_openai_payload(const ImageGenerationRequest& request) {
         payload["style"] = *request.style;
     }
     if (request.native_transparency) {
-        // For gpt-image-1-style APIs, PNG output is the documented switch that
-        // enables alpha-capable output. Some gateways turn background fields
-        // into an opaque white compatibility path, so do not inject them by default.
+        // Prefer explicit transparent background for gateways that support
+        // native alpha. If a provider rejects this field, the request layer
+        // below will retry once without it.
         payload["output_format"] = "png";
+        payload["background"] = "transparent";
     }
 
     merge_extra_fields(payload, request.extra);
@@ -102,10 +103,73 @@ Json build_openai_edit_payload(const ImageEditRequest& request) {
     }
     if (request.native_transparency) {
         payload["output_format"] = "png";
+        payload["background"] = "transparent";
     }
 
     merge_extra_fields(payload, request.extra);
     return payload;
+}
+
+std::string json_scalar_to_string(const Json& value) {
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_boolean()) {
+        return value.get<bool>() ? "true" : "false";
+    }
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<long long>());
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<unsigned long long>());
+    }
+    if (value.is_number_float()) {
+        return std::to_string(value.get<double>());
+    }
+    return value.dump();
+}
+
+std::vector<MultipartField> multipart_fields_from_payload(const Json& payload) {
+    std::vector<MultipartField> fields;
+    for (const auto& item : payload.items()) {
+        if (item.value().is_null()) {
+            continue;
+        }
+        if (item.value().is_array() || item.value().is_object()) {
+            fields.push_back(MultipartField{item.key(), item.value().dump(), {}, {}});
+        } else {
+            fields.push_back(MultipartField{item.key(), json_scalar_to_string(item.value()), {}, {}});
+        }
+    }
+    return fields;
+}
+
+std::vector<MultipartField> multipart_fields_from_edit_request(const ImageEditRequest& request, const Json& payload) {
+    std::vector<MultipartField> fields;
+    for (const auto& item : payload.items()) {
+        if (item.key() == "image" || item.value().is_null()) {
+            continue;
+        }
+        if (item.value().is_array() || item.value().is_object()) {
+            fields.push_back(MultipartField{item.key(), item.value().dump(), {}, {}});
+        } else {
+            fields.push_back(MultipartField{item.key(), json_scalar_to_string(item.value()), {}, {}});
+        }
+    }
+
+    std::size_t index = 0;
+    for (const ImageData& image : request.input_images) {
+        const std::string mime_type = image.mime_type.empty() ? std::string("image/png") : image.mime_type;
+        const std::string filename = "input_" + std::to_string(index) + (mime_type == "image/jpeg" ? ".jpg" : ".png");
+        fields.push_back(MultipartField{
+            "image",
+            std::string(reinterpret_cast<const char*>(image.bytes.data()), image.bytes.size()),
+            filename,
+            mime_type
+        });
+        ++index;
+    }
+    return fields;
 }
 
 } // namespace
@@ -189,13 +253,19 @@ ImageGenerationResult OpenAIImageProvider::generate(const ImageGenerationRequest
         {"Accept", "application/json"}
     };
 
-    HttpResponse response = http.post_json(generations_url(), headers, payload.dump());
+    HttpResponse response = http.post_multipart(generations_url(), headers, multipart_fields_from_payload(payload));
+    if (response.status == 502 && payload.contains("background")) {
+        Json fallback_payload = payload;
+        fallback_payload.erase("background");
+        response = http.post_multipart(generations_url(), headers, multipart_fields_from_payload(fallback_payload));
+        payload = std::move(fallback_payload);
+    }
     if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
         // Some gateways expose image models that only accept their default/native
         // size or 1024x1024. If a smaller requested size causes an upstream 502,
         // retry once with 1024x1024 and let the local post-process pipeline shrink it.
         payload["size"] = "1024x1024";
-        response = http.post_json(generations_url(), headers, payload.dump());
+        response = http.post_multipart(generations_url(), headers, multipart_fields_from_payload(payload));
     }
     return parse_image_response(http, response);
 }
@@ -209,10 +279,16 @@ ImageGenerationResult OpenAIImageProvider::edit(const ImageEditRequest& request)
         {"Accept", "application/json"}
     };
 
-    HttpResponse response = http.post_json(edits_url(), headers, payload.dump());
+    HttpResponse response = http.post_multipart(edits_url(), headers, multipart_fields_from_edit_request(request, payload));
+    if (response.status == 502 && payload.contains("background")) {
+        Json fallback_payload = payload;
+        fallback_payload.erase("background");
+        response = http.post_multipart(edits_url(), headers, multipart_fields_from_edit_request(request, fallback_payload));
+        payload = std::move(fallback_payload);
+    }
     if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
         payload["size"] = "1024x1024";
-        response = http.post_json(edits_url(), headers, payload.dump());
+        response = http.post_multipart(edits_url(), headers, multipart_fields_from_edit_request(request, payload));
     }
     return parse_image_response(http, response);
 }

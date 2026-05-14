@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -77,6 +78,53 @@ HttpResponse from_result(const httplib::Result& result) {
     response.status = result->status;
     response.body = result->body;
     return response;
+}
+
+std::string generate_boundary() {
+    static const char charset[] = "0123456789abcdef";
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(0, 15);
+    std::string boundary = "----mcdk";
+    for (int i = 0; i < 24; ++i) {
+        boundary += charset[dist(gen)];
+    }
+    return boundary;
+}
+
+std::string escape_multipart_quoted(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char ch : value) {
+        if (ch == '"' || ch == '\\') {
+            escaped += '\\';
+        }
+        escaped += ch;
+    }
+    return escaped;
+}
+
+std::string build_multipart_body(const std::vector<MultipartField>& fields, const std::string& boundary) {
+    std::string body;
+    for (const auto& field : fields) {
+        body += "--" + boundary + "\r\n";
+        body += "Content-Disposition: form-data; name=\"" + escape_multipart_quoted(field.name) + "\"";
+        if (!field.filename.empty()) {
+            body += "; filename=\"" + escape_multipart_quoted(field.filename) + "\"";
+        }
+        body += "\r\n";
+        if (field.filename.empty()) {
+            body += "Content-Type: text/plain; charset=UTF-8\r\n";
+        } else {
+            body += "Content-Type: " + (field.content_type.empty() ? std::string("application/octet-stream") : field.content_type) + "\r\n";
+            body += "Content-Transfer-Encoding: binary\r\n";
+        }
+        body += "\r\n";
+        body += field.value;
+        body += "\r\n";
+    }
+    body += "--" + boundary + "--\r\n";
+    return body;
 }
 
 #ifdef _WIN32
@@ -287,6 +335,41 @@ HttpResponse HttpClient::post_json(
         return from_result(client.Post(parsed.path, http_headers, body, "application/json"));
 #elif defined(_WIN32)
         return winhttp_request(parsed, "POST", headers, body, "application/json", timeout_seconds_);
+#else
+        return HttpResponse{0, {}, "HTTPS requires MCP_SSL=ON / CPPHTTPLIB_OPENSSL_SUPPORT on this platform"};
+#endif
+    }
+
+    return HttpResponse{0, {}, "unsupported URL scheme: " + parsed.scheme};
+}
+
+HttpResponse HttpClient::post_multipart(
+    const std::string& url,
+    const std::map<std::string, std::string>& headers,
+    const std::vector<MultipartField>& fields
+) const {
+    const ParsedUrl parsed = parse_url(url);
+    const std::string boundary = generate_boundary();
+    const std::string content_type = "multipart/form-data; boundary=" + boundary;
+    const std::string body = build_multipart_body(fields, boundary);
+
+    if (parsed.scheme == "http") {
+        httplib::Client client(parsed.host, parsed.port);
+        client.set_connection_timeout(30, 0);
+        client.set_read_timeout(timeout_seconds_, 0);
+        client.set_write_timeout(timeout_seconds_, 0);
+        return from_result(client.Post(parsed.path, to_httplib_headers(headers), body, content_type));
+    }
+
+    if (parsed.scheme == "https") {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient client(parsed.host, parsed.port);
+        client.set_connection_timeout(30, 0);
+        client.set_read_timeout(timeout_seconds_, 0);
+        client.set_write_timeout(timeout_seconds_, 0);
+        return from_result(client.Post(parsed.path, to_httplib_headers(headers), body, content_type));
+#elif defined(_WIN32)
+        return winhttp_request(parsed, "POST", headers, body, content_type, timeout_seconds_);
 #else
         return HttpResponse{0, {}, "HTTPS requires MCP_SSL=ON / CPPHTTPLIB_OPENSSL_SUPPORT on this platform"};
 #endif

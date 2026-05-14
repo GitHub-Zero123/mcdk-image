@@ -292,7 +292,7 @@ ImageBuffer remove_fake_transparency_background(const ImageBuffer& source, int t
 }
 
 ImageData process_image_data(const ImageData& input, const ImageProcessingOptions& options) {
-    if (!options.enabled) {
+    if (!options.enabled && !options.force_png_output) {
         return input;
     }
 

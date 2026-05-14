@@ -17,6 +17,7 @@ struct ImageBuffer {
 
 struct ImageProcessingOptions {
     bool enabled = false;
+    bool force_png_output = false;
     bool nearest_resize_enabled = false;
     int nearest_target_width = 0;
     int nearest_target_height = 0;

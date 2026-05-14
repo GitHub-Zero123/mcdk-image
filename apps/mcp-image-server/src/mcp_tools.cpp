@@ -347,11 +347,13 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
     const bool return_base64 = bool_param(params, "returnBase64", true);
     const bool save_to_file = bool_param(params, "saveToFile", false);
     const bool self_review_hint = bool_param(params, "selfReviewHint", true);
+    const bool needs_final_png = return_base64 || self_review_hint || save_to_file;
 
     OpenAIImageProvider provider(config);
     ImageGenerationRequest request = parse_generation_request(params, config);
     request.prompt = minecraft_asset_prompt(request.prompt);
     ImageProcessingOptions processing = parse_processing_options(params);
+    processing.force_png_output = needs_final_png || request.native_transparency;
     ImageGenerationResult generated = provider.generate(request);
 
     Json metadata = Json::object();
@@ -513,11 +515,13 @@ Json handle_edit_image(const Json& params, const AppConfig& config) {
     const bool return_base64 = bool_param(params, "returnBase64", true);
     const bool save_to_file = bool_param(params, "saveToFile", false);
     const bool self_review_hint = bool_param(params, "selfReviewHint", true);
+    const bool needs_final_png = return_base64 || self_review_hint || save_to_file;
 
     OpenAIImageProvider provider(config);
     ImageEditRequest request = parse_edit_request(params, config);
     request.prompt = minecraft_asset_prompt(request.prompt);
     ImageProcessingOptions processing = parse_processing_options(params);
+    processing.force_png_output = needs_final_png || request.native_transparency;
     ImageGenerationResult edited = provider.edit(request);
 
     Json metadata = Json::object();
