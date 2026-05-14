@@ -251,7 +251,7 @@ ImageEditRequest parse_edit_request(const Json& params, const AppConfig& config)
 Json shared_processing_properties() {
     return {
         {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
-        {"chromaKey", {{"type", "object"}, {"description", "Remove a guided solid-color screen background into real alpha. Defaults to pure green RGB(0,255,0). Fields: enabled,r,g,b,tolerance,softness,spillSuppression."}}},
+        {"chromaKey", {{"type", "object"}, {"description", "Remove a guided solid-color chroma screen background into real alpha. Defaults to RGB(0,255,0), but the key color is configurable via r,g,b and should be chosen to avoid conflicts with the asset's dominant palette and translucent edge colors. Fields: enabled,r,g,b,tolerance,softness,spillSuppression."}}},
         {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
         {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
         {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
@@ -263,7 +263,7 @@ mcp::tool build_generate_image_tool() {
     Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("generate_image")
-        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Models behind sub2api-style gateways usually do not return true native alpha even for PNG, so the recommended transparent workflow is: request a flat pure-green chroma screen via processing.chromaKey.enabled=true, then locally remove that green into alpha. Default generation size is 1024x1024; post-process down to 32x32 or 16x16 for Minecraft assets. Base64 is returned only when the final output is <=128x128; larger images must be saved or downsampled first.")
+        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Models behind sub2api-style gateways usually do not return true native alpha even for PNG, so the recommended transparent workflow is: request a flat solid chroma screen via processing.chromaKey.enabled=true, then locally remove that configured key color into alpha. The key color is not required to be green: choose r,g,b to avoid conflicts with the asset's dominant palette and semi-transparent edge colors. Default generation size is 1024x1024; post-process down to 32x32 or 16x16 for Minecraft assets. Base64 is returned only when the final output is <=128x128; larger images must be saved or downsampled first.")
         .with_string_param("prompt", "Image prompt", true)
         .with_string_param("model", "Image model override for this request", false)
         .with_string_param("size", "Optional provider image size. Defaults to 1024x1024 because some gateways reject 512x512; use smaller sizes only when the provider is known to support them.", false)
@@ -310,7 +310,7 @@ mcp::tool build_edit_image_tool() {
     Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("edit_image")
-        .with_description("Edit an existing image through the environment-configured OpenAI-compatible image edit endpoint. Input can come from a cached generate_image/edit_image jobId, an absolute UTF-8 inputPath, or inputBase64. For transparent output, prefer processing.chromaKey.enabled=true so the edit is guided onto a flat pure-green screen and then locally keyed to alpha. Base64 is returned only when the final output is <=128x128.")
+        .with_description("Edit an existing image through the environment-configured OpenAI-compatible image edit endpoint. Input can come from a cached generate_image/edit_image jobId, an absolute UTF-8 inputPath, or inputBase64. For transparent output, prefer processing.chromaKey.enabled=true so the edit is guided onto a flat solid chroma screen and then locally keyed to alpha. The key color is configurable and should be selected to contrast with the image style rather than always using green. Base64 is returned only when the final output is <=128x128.")
         .with_string_param("prompt", "Edit instruction prompt", true)
         .with_string_param("model", "Image model override for this request", false)
         .with_string_param("sourceJobId", "Cached source jobId returned by generate_image or edit_image", false)
@@ -342,14 +342,35 @@ std::string minecraft_asset_prompt(const std::string& user_prompt) {
           "Keep a clean readable silhouette, centered object, crisp pixel-art edges, and low-noise colors.";
 }
 
+int clamp_color_channel(int value) {
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 255) {
+        return 255;
+    }
+    return value;
+}
+
+std::string chroma_key_color_text(const ImageProcessingOptions& processing) {
+    std::ostringstream stream;
+    stream << "RGB("
+           << clamp_color_channel(processing.chroma_key_r) << ","
+           << clamp_color_channel(processing.chroma_key_g) << ","
+           << clamp_color_channel(processing.chroma_key_b) << ")";
+    return stream.str();
+}
+
 std::string chroma_key_prompt(const std::string& prompt, const ImageProcessingOptions& processing) {
     if (!processing.chroma_key_enabled) {
         return prompt;
     }
+    const std::string key_color = chroma_key_color_text(processing);
     return prompt
-        + "\n\nChroma-key transparency workflow: render the asset in front of a perfectly flat pure green screen background RGB(0,255,0) / #00FF00. "
-          "The green background must be a single uniform solid color, with no gradients, shadows, texture, border, checkerboard, glow, vignette, ground plane, or environmental lighting on it. "
-          "Keep the object fully separate from the green screen. Avoid green colors inside the asset unless absolutely necessary.";
+        + "\n\nChroma-key transparency workflow: render the asset in front of a perfectly flat solid chroma-key screen background " + key_color + ". "
+          "The chroma-key color is not required to be green; it should be configured to strongly contrast with the asset's dominant palette and to avoid colors that may appear in semi-transparent pixels or glow edges. "
+          "Use exactly this configured key color as a single uniform solid background, with no gradients, shadows, texture, border, checkerboard, glow, vignette, ground plane, or environmental lighting on it. "
+          "Keep the object fully separate from the chroma-key screen. Avoid this key color and nearby hues inside the asset unless absolutely necessary.";
 }
 
 bool image_too_large_for_base64(const ImageData& image, int max_dimension = 128) {

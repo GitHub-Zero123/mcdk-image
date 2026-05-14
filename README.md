@@ -60,25 +60,23 @@ Agent 会调用图像工具生成图片，并把结果保存在当前 MCP 进程
 
 实际生成通常先用大尺寸获得更完整的图，再压缩为游戏所需的小尺寸。
 
-## 关于透明背景
+## 关于透明背景与可配置色幕
 
-透明背景应由图像模型的原生 PNG 输出能力处理，而不是写进提示词里让模型“画一个透明背景”。
+不要直接在提示词里要求模型“画透明背景”。部分模型会把“透明背景”“半透明”“棋盘格”理解成画面内容，从而画出白底、灰底或伪透明格子。
 
-推荐说法：
+本工具支持两类透明方案：
 
-> 生成一个单独的物品图标，主体居中，适合游戏贴图。
+1. **原生 PNG alpha**：通过模型参数请求透明输出；只有当网关和模型本身真的支持 alpha 时才可靠。
+2. **色幕抠图**：引导模型把素材画在单一纯色背景上，再由本地后处理把这块纯色转成真正 alpha。当前更推荐这个方案。
 
-不推荐说法：
+色幕不一定必须是绿色。应根据素材主色调选择最不容易冲突的颜色：
 
-> 画在透明背景上。
+- 避开素材主体的主色、发光边缘、半透明边缘、宝石/能量特效颜色。
+- 选择画面中几乎不会自然出现的高饱和纯色。
+- 蓝色水晶、蓝色魔法素材可考虑洋红或黄绿色；绿色植物、史莱姆、毒液素材可考虑洋红；火焰、金色、橙色素材可考虑青蓝；灰黑金属通常可使用亮绿或洋红。
+- 色幕颜色必须和 `processing.chromaKey.r/g/b` 配置一致，否则后处理无法准确移除背景。
 
-> 画一个半透明背景。
-
-> 不要棋盘格透明背景。
-
-原因是部分模型会把“透明背景”“半透明”“棋盘格”理解成画面内容，从而画出白底、灰底或伪透明格子。
-
-本工具会通过模型参数请求 PNG 输出；如果网关或模型确实支持 alpha，结果应包含真正透明通道。
+推荐让 Agent 使用 `processing.chromaKey.enabled=true`，并根据素材风格设置 `r/g/b`。工具会把所选 RGB 色幕自动补充进生成/编辑提示词。
 
 ## 使用时的自然语言提示建议
 
@@ -120,6 +118,41 @@ MCP 服务进程的工作目录不一定等于你的项目目录。使用完整�
 
 可以。你可以让 Agent 使用上一张缓存图继续编辑，也可以提供已有图片路径，让模型做二次编辑。
 
+## MCP 配置示例
+
+以下配置仅作为模板。不要把真实可执行文件路径、真实网关地址或真实 API Key 提交到仓库；请在你自己的 MCP 客户端配置中替换为本机路径和私有凭据。
+
+```json
+{
+    "mcpServers": {
+        "mcdk_image_stdio": {
+            "command": "D:/path/to/mcdk-image-server.exe",
+            "args": [],
+            "env": {
+            // 目前仅支持openai协议
+            "MCDK_IMAGE_PROTOCOL": "openai",
+            "MCDK_IMAGE_BASE_URL": "https://your-openai-compatible-endpoint.example/v1",
+            "MCDK_IMAGE_API_KEY": "sk-your-api-key",
+            "MCDK_IMAGE_DEFAULT_MODEL": "gpt-image-2",
+            "MCDK_IMAGE_TIMEOUT_SECONDS": "400"
+            },
+            "timeout": 400,
+            "disabled": false,
+            "alwaysAllow": []
+        }
+    }
+}
+```
+
+字段说明：
+
+- `command`：本机编译出的 `mcdk-image-server` 可执行文件完整路径。
+- `MCDK_IMAGE_PROTOCOL`：目前使用 OpenAI 兼容接口时填写 `openai`。
+- `MCDK_IMAGE_BASE_URL`：OpenAI 兼容图像网关地址，通常以 `/v1` 结尾。
+- `MCDK_IMAGE_API_KEY`：你的私有 API Key，不要提交到公开仓库。
+- `MCDK_IMAGE_DEFAULT_MODEL`：默认图像模型，例如 `gpt-image-2`。
+- `MCDK_IMAGE_TIMEOUT_SECONDS`：图像生成/编辑超时时间，建议给到 `400` 秒左右。
+
 ## 给部署者的说明
 
 普通用户不需要理解工具参数或构建流程。
@@ -130,6 +163,7 @@ MCP 服务进程的工作目录不一定等于你的项目目录。使用完整�
 - 图像模型网关可用；
 - API Key 已通过环境变量配置；
 - 保存路径使用完整绝对路径；
-- 如果需要原生透明，网关和模型本身必须支持 alpha-capable PNG 输出。
+- 如果需要原生透明，网关和模型本身必须支持 alpha-capable PNG 输出；
+- 如果模型不稳定支持原生透明，优先使用可配置色幕 + `processing.chromaKey` 后处理方案。
 
 更详细的工程计划、接口设计和实现细节见 `plans/mcp-image-model-server-plan.md`。
