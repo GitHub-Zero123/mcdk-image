@@ -347,7 +347,8 @@ std::vector<std::uint8_t> base64_decode_bytes(const std::string& encoded) {
 }
 
 std::vector<std::uint8_t> read_binary_file(const std::string& path) {
-    std::ifstream input(path, std::ios::binary);
+    const std::filesystem::path input_path = std::filesystem::u8path(path);
+    std::ifstream input(input_path, std::ios::binary);
     if (!input) {
         throw std::runtime_error("file_io_error: failed to open input file: " + path);
     }
@@ -355,12 +356,12 @@ std::vector<std::uint8_t> read_binary_file(const std::string& path) {
 }
 
 void write_binary_file(const std::string& path, const std::vector<std::uint8_t>& bytes) {
-    const std::filesystem::path output_path(path);
+    const std::filesystem::path output_path = std::filesystem::u8path(path);
     if (output_path.has_parent_path()) {
         std::filesystem::create_directories(output_path.parent_path());
     }
 
-    std::ofstream output(path, std::ios::binary);
+    std::ofstream output(output_path, std::ios::binary);
     if (!output) {
         throw std::runtime_error("file_io_error: failed to open output file: " + path);
     }

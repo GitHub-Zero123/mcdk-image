@@ -171,6 +171,20 @@ struct ImageGenerationRequest {
     std::optional<int> n;
     std::optional<std::string> quality;
     std::optional<std::string> style;
+    nlohmann::json extra;
+    bool native_transparency = false;
+    int timeout_seconds = 400;
+};
+
+struct ImageEditRequest {
+    std::string prompt;
+    std::string model;
+    std::vector<ImageData> input_images;
+    std::optional<std::string> size;
+    std::optional<int> n;
+    std::optional<std::string> quality;
+    nlohmann::json extra;
+    bool native_transparency = false;
     int timeout_seconds = 400;
 };
 
@@ -183,6 +197,7 @@ class ImageProvider {
 public:
     virtual ~ImageProvider() = default;
     virtual ImageGenerationResult generate(const ImageGenerationRequest& request) = 0;
+    virtual ImageGenerationResult edit(const ImageEditRequest& request) = 0;
 };
 ```
 
@@ -210,14 +225,13 @@ std::unique_ptr<ImageProvider> create_provider(const AppConfig& config);
 Provider 连接配置只允许通过环境变量传递，不允许从 MCP tool 参数或命令行参数传递：
 
 1. 环境变量：`MCDK_IMAGE_PROTOCOL`、`MCDK_IMAGE_BASE_URL`、`MCDK_IMAGE_API_KEY`。
-2. 默认配置：仅用于非敏感、非 Provider 连接项，例如默认输出目录、默认超时。
-3. MCP tool 参数：只允许传递单次任务参数，例如 prompt、size、n、processing、returnBase64、timeoutSeconds，不允许覆盖 Provider 连接配置。
-4. 命令行参数：只允许传递非敏感运行参数，例如 `--output-dir`、`--log-level`；不提供 `--protocol`、`--base-url`、`--api-key`、`--api-key-env`。
+2. 默认配置：仅用于非敏感、非 Provider 连接项，例如默认模型、默认超时。
+3. MCP tool 参数：只允许传递单次任务参数，例如 prompt、size、n、processing、returnBase64、timeoutSeconds；涉及文件落盘时必须显式传递绝对 UTF-8 `outputPath`，严禁相对路径。
+4. 命令行参数：只允许传递非敏感运行参数，例如 `--timeout-seconds`、`--log-level`；不提供 `--output-dir`、`--protocol`、`--base-url`、`--api-key`、`--api-key-env`。
 
 ### 5.2 建议命令行参数
 
 ```text
---output-dir ./outputs
 --timeout-seconds 400
 --log-level info
 ```
@@ -229,7 +243,6 @@ MCDK_IMAGE_PROTOCOL=openai
 MCDK_IMAGE_BASE_URL=https://api.openai.com
 MCDK_IMAGE_API_KEY=...
 MCDK_IMAGE_DEFAULT_MODEL=gpt-image-1
-MCDK_IMAGE_OUTPUT_DIR=./outputs
 MCDK_IMAGE_TIMEOUT_SECONDS=400
 ```
 
@@ -277,8 +290,9 @@ MCDK_IMAGE_TIMEOUT_SECONDS=400
       "paletteLimit": "number, optional"
     }
   },
-  "returnBase64": "boolean, default: false",
-  "saveToFile": "boolean, default: true",
+  "returnBase64": "boolean, default: true",
+  "saveToFile": "boolean, default: false",
+  "outputPath": "absolute UTF-8 path, required when saveToFile=true",
   "timeoutSeconds": "number, optional, default: 400"
 }
 ```
@@ -308,7 +322,7 @@ metadata：
       "mimeType": "image/png",
       "width": 512,
       "height": 512,
-      "filePath": "outputs/xxx.png",
+      "filePath": "D:/绝对路径/xxx.png",
       "base64": "optional when returnBase64=true",
       "processing": {
         "nearestResizeApplied": true,
@@ -323,18 +337,49 @@ metadata：
 }
 ```
 
-### 6.2 process_image
+### 6.2 edit_image
+
+用途：对已有图像做连续二次编辑，可用于“生成 -> 自审 -> 编辑修正 -> 再自审”的循环。输入图像来源三选一：缓存 `sourceJobId`、绝对 UTF-8 `inputPath`、或 `inputBase64`。
+
+输入 schema 建议：
+
+```json
+{
+  "prompt": "string, required, edit instruction",
+  "model": "string, optional",
+  "sourceJobId": "string, optional, cached generate_image/edit_image result",
+  "sourceIndex": "number, optional, default: 0",
+  "inputPath": "absolute UTF-8 path, optional",
+  "inputBase64": "string, optional",
+  "inputMimeType": "string, optional, default: image/png",
+  "size": "string, optional, default: 1024x1024",
+  "n": "number, optional, default: 1",
+  "quality": "string, optional",
+  "nativeTransparency": "boolean, optional, request alpha-capable PNG via provider parameters",
+  "extra": "object, optional, provider-specific edit parameters",
+  "processing": "object, optional, same as generate_image",
+  "returnBase64": "boolean, default: true",
+  "saveToFile": "boolean, default: false",
+  "outputPath": "absolute UTF-8 path, required when saveToFile=true",
+  "selfReviewHint": "boolean, default: true",
+  "timeoutSeconds": "number, optional, default: 400"
+}
+```
+
+输出：同 `generate_image`，返回新的 `jobId`，编辑结果进入内存缓存；确认后调用 `save_cached_image(jobId,index,outputPath)` 落盘，避免重新编辑。
+
+### 6.3 process_image
 
 用途：只处理本地图像或 base64 图像，不调用图像模型。便于 LLM Agent 对已有贴图、像素画素材做压缩和透明域缩放。
 
 输入：
 
-- `inputPath` 或 `inputBase64` 二选一。
+- `inputPath` 或 `inputBase64` 二选一；若使用 `inputPath`，必须是绝对 UTF-8 路径。
 - `processing` 同 `generate_image`。
 - `returnBase64`。
-- `outputPath` 可选。
+- `outputPath` 必填，且必须是绝对 UTF-8 路径。
 
-### 6.3 self_review_image（可选二期）
+### 6.4 self_review_image（可选二期）
 
 用途：当上游 LLM 支持视觉能力时，MCP 返回 base64 与结构化审查提示，由 Agent 自己进行视觉自审。由于 MCP 服务本身未必拥有多模态 LLM，建议初版不在服务内直接调用审查 LLM，而是通过 `returnBase64=true` 与审查模板让 Agent 完成自审。
 
@@ -348,7 +393,7 @@ metadata：
 }
 ```
 
-### 6.4 iterate_image（可选二期）
+### 6.5 iterate_image（可选二期）
 
 用途：支持 Agent 带着上一轮自审意见再次调用生成或编辑。
 
@@ -369,6 +414,7 @@ metadata：
 
 ```text
 POST {baseURL}/v1/images/generations
+POST {baseURL}/v1/images/edits
 ```
 
 兼容项：
@@ -396,6 +442,9 @@ POST {baseURL}/v1/images/generations
 - 已知字段按白名单传递。
 - `extra` 对象允许透传供应商扩展字段。
 - 响应解析同时支持 `b64_json` 与 `url` 两类结果。
+- 原生透明/半透明不通过 prompt 文本表达；tool 描述引导 Agent 使用 `nativeTransparency` 或 `extra`。
+- `nativeTransparency=true` 默认只注入 `output_format="png"`，不默认注入 `background="transparent"` 或 `response_format`，避免 OpenAI-compatible 网关进入白底兼容路径；需要特殊网关字段时由 `extra` 显式覆盖。
+- `edit_image` 使用 `image: [{ type: "input_image", image_url: "data:image/png;base64,..." }]` 的 JSON data URL 形式调用 `/v1/images/edits`，用于缓存图或已有图片的连续编辑。
 
 ### 7.3 响应处理
 
@@ -549,7 +598,7 @@ generate -> review -> refine prompt -> generate/edit -> review -> final
 - 限制 `n` 的最大值，初版建议 `n <= 4`。
 - 限制最大输入/输出图像尺寸，避免内存爆炸。
 - 限制 base64 返回大小；超过阈值时只返回文件路径。
-- 默认保存到工作目录下的 `outputs/`，防止任意路径写入；如允许自定义输出路径，需要做路径规范化与越界检查。
+- 所有工具文件路径必须由调用方显式传递绝对 UTF-8 路径；禁止默认输出目录、禁止相对路径、禁止在服务内把相对路径转换为绝对路径。
 - 自动轮询必须有最大次数和总超时。
 
 ## 12. 测试计划
@@ -581,7 +630,6 @@ generate -> review -> refine prompt -> generate/edit -> review -> final
     "mcdk-image": {
       "command": "path/to/mcp-image-server.exe",
       "args": [
-        "--output-dir", "./outputs",
         "--timeout-seconds", "400"
       ],
       "env": {

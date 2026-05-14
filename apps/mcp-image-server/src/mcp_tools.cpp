@@ -41,6 +41,30 @@ std::string make_job_id() {
     return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+std::filesystem::path utf8_path_from_string(const std::string& value) {
+    return std::filesystem::u8path(value);
+}
+
+std::string path_to_utf8_string(const std::filesystem::path& path) {
+    const auto value = path.u8string();
+    return std::string(reinterpret_cast<const char*>(value.data()), value.size());
+}
+
+std::filesystem::path require_absolute_utf8_path(const std::string& value, const char* field_name) {
+    if (value.empty()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, std::string(field_name) + " must not be empty");
+    }
+
+    std::filesystem::path path = utf8_path_from_string(value).lexically_normal();
+    if (!path.is_absolute()) {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            std::string(field_name) + " must be an absolute UTF-8 file path; relative paths are forbidden"
+        );
+    }
+    return path;
+}
+
 std::string extension_from_mime(const std::string& mime) {
     if (mime == "image/jpeg") {
         return ".jpg";
@@ -49,6 +73,43 @@ std::string extension_from_mime(const std::string& mime) {
         return ".webp";
     }
     return ".png";
+}
+
+std::string mime_from_path(const std::filesystem::path& path) {
+    const std::string ext = path_to_utf8_string(path.extension());
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".JPG" || ext == ".JPEG") {
+        return "image/jpeg";
+    }
+    if (ext == ".webp" || ext == ".WEBP") {
+        return "image/webp";
+    }
+    return "image/png";
+}
+
+std::filesystem::path indexed_output_path(std::filesystem::path output_path, std::size_t index, const std::string& mime_type) {
+    const std::filesystem::path parent = output_path.parent_path();
+    const std::string stem = path_to_utf8_string(output_path.stem());
+    const std::string ext = output_path.has_extension() ? path_to_utf8_string(output_path.extension()) : extension_from_mime(mime_type);
+    return (parent / std::filesystem::u8path(stem + "-" + std::to_string(index) + ext)).lexically_normal();
+}
+
+CachedImage get_cached_image(const std::string& job_id, int image_index) {
+    if (job_id.empty()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "jobId/sourceJobId must not be empty");
+    }
+    if (image_index < 0) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "index/sourceIndex must be >= 0");
+    }
+
+    std::lock_guard<std::mutex> lock(image_cache_mutex());
+    auto job_it = image_cache().find(job_id);
+    if (job_it == image_cache().end()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "cached jobId not found or MCP process was restarted");
+    }
+    if (static_cast<std::size_t>(image_index) >= job_it->second.size()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "cached image index out of range");
+    }
+    return job_it->second[static_cast<std::size_t>(image_index)];
 }
 
 bool bool_param(const Json& params, const char* key, bool fallback) {
@@ -81,6 +142,42 @@ Json tool_content_with_metadata(const std::string& summary, const Json& metadata
         Json{{"type", "text"}, {"text", summary}},
         Json{{"type", "text"}, {"text", metadata.dump(2)}}
     });
+}
+
+ImageData cached_to_image_data(const CachedImage& cached) {
+    ImageData image;
+    image.mime_type = cached.mime_type;
+    image.bytes = cached.bytes;
+    return image;
+}
+
+ImageData load_single_input_image(const Json& params) {
+    const auto source_job_id = string_param(params, "sourceJobId");
+    const auto input_path = string_param(params, "inputPath");
+    const auto input_base64 = string_param(params, "inputBase64");
+    const int source_count = (source_job_id ? 1 : 0) + (input_path ? 1 : 0) + (input_base64 ? 1 : 0);
+    if (source_count != 1) {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            "exactly one of sourceJobId, inputPath, or inputBase64 is required"
+        );
+    }
+
+    if (source_job_id) {
+        return cached_to_image_data(get_cached_image(*source_job_id, int_param(params, "sourceIndex", 0)));
+    }
+
+    ImageData image;
+    if (input_path) {
+        const std::filesystem::path path = require_absolute_utf8_path(*input_path, "inputPath");
+        image.mime_type = string_param(params, "inputMimeType").value_or(mime_from_path(path));
+        image.bytes = read_binary_file(path_to_utf8_string(path));
+        return image;
+    }
+
+    image.mime_type = string_param(params, "inputMimeType").value_or("image/png");
+    image.bytes = base64_decode_bytes(*input_base64);
+    return image;
 }
 
 ImageGenerationRequest parse_generation_request(const Json& params, const AppConfig& config) {
@@ -117,14 +214,52 @@ ImageGenerationRequest parse_generation_request(const Json& params, const AppCon
     return request;
 }
 
-mcp::tool build_generate_image_tool() {
-    Json processing_properties = {
+ImageEditRequest parse_edit_request(const Json& params, const AppConfig& config) {
+    if (!params.contains("prompt") || !params["prompt"].is_string() || params["prompt"].get<std::string>().empty()) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "prompt is required");
+    }
+
+    ImageEditRequest request;
+    request.prompt = params["prompt"].get<std::string>();
+    request.model = string_param(params, "model").value_or(config.default_model);
+    request.size = string_param(params, "size").value_or("1024x1024");
+    request.quality = string_param(params, "quality");
+    request.native_transparency = bool_param(params, "nativeTransparency", false);
+    request.timeout_seconds = int_param(params, "timeoutSeconds", config.timeout_seconds);
+    request.input_images.push_back(load_single_input_image(params));
+
+    const int n = int_param(params, "n", 1);
+    if (n <= 0 || n > 4) {
+        throw mcp::mcp_exception(mcp::error_code::invalid_params, "n must be between 1 and 4");
+    }
+    request.n = n;
+
+    if (params.contains("extra") && params["extra"].is_object()) {
+        request.extra = params["extra"];
+    }
+
+    if (params.contains("provider")) {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            "provider connection config must be passed by environment variables only"
+        );
+    }
+
+    return request;
+}
+
+Json shared_processing_properties() {
+    return {
         {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
         {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
         {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
         {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
         {"removeFakeTransparency", {{"type", "object"}, {"description", "Convert fake checkerboard/solid background colors into real alpha transparency"}}}
     };
+}
+
+mcp::tool build_generate_image_tool() {
+    Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("generate_image")
         .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Default generation size is 1024x1024 because some gateways reject 512x512 with upstream errors; post-process down to 32x32 or 16x16 for most Minecraft pixel-art assets. 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets. Default workflow keeps the image in memory and returns base64 for LLM self-review; only save to file when saveToFile=true after review. Prompts should request a single item/entity/block asset, not a grid, collage, spritesheet, or multiple objects. True transparency/semi-transparency should be requested through nativeTransparency or provider extra fields, not only through prompt wording.")
@@ -138,8 +273,8 @@ mcp::tool build_generate_image_tool() {
         .with_object_param("extra", "Extra provider JSON fields, excluding connection config. Use this for provider-specific native alpha/transparency controls.", Json::object(), false)
         .with_object_param("processing", "Optional image processing pipeline", processing_properties, false)
         .with_boolean_param("returnBase64", "Return image base64 in metadata. Defaults to true for in-memory review.", false)
-        .with_boolean_param("saveToFile", "Save image files to output directory. Defaults to false; enable only after self-review accepts the asset.", false)
-        .with_string_param("outputPath", "Optional output file path/name when saveToFile=true. For multiple images, an index is appended before the extension.", false)
+        .with_boolean_param("saveToFile", "Save image files only when an explicit absolute UTF-8 outputPath is provided. Defaults to false; enable only after self-review accepts the asset.", false)
+        .with_string_param("outputPath", "Required absolute UTF-8 output file path/name when saveToFile=true. Relative paths are rejected. For multiple images, an index is appended before the extension.", false)
         .with_boolean_param("selfReviewHint", "Return a visual self-review prompt and base64 payload. Defaults to true.", false)
         .with_number_param("timeoutSeconds", "Per-request timeout seconds, default 400", false)
         .with_open_world_hint(true)
@@ -151,28 +286,49 @@ mcp::tool build_save_cached_image_tool() {
         .with_description("Save an image previously generated in memory by generate_image without calling the image model again. Use this after LLM self-review accepts the cached asset.")
         .with_string_param("jobId", "The jobId returned by generate_image", true)
         .with_number_param("index", "Image index in the cached job, default 0", false)
-        .with_string_param("outputPath", "Optional output file path. Defaults to configured output directory", false)
+        .with_string_param("outputPath", "Required absolute UTF-8 output file path. Relative paths are rejected.", true)
         .with_read_only_hint(false)
         .build();
 }
 
 mcp::tool build_process_image_tool() {
-    Json processing_properties = {
-        {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
-        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
-        {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
-        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
-        {"removeFakeTransparency", {{"type", "object"}, {"description", "Convert fake checkerboard/solid background colors into real alpha transparency"}}}
-    };
+    Json processing_properties = shared_processing_properties();
 
     return mcp::tool_builder("process_image")
         .with_description("Process a local image file or base64 image with Minecraft-oriented nearest-neighbor, transparent-domain, 16/32/64/128 pixel-art sizing, and fake-transparency cleanup operations.")
-        .with_string_param("inputPath", "Input image file path", false)
+        .with_string_param("inputPath", "Absolute UTF-8 input image file path. Relative paths are rejected.", false)
         .with_string_param("inputBase64", "Input image base64", false)
-        .with_string_param("outputPath", "Output file path", false)
+        .with_string_param("outputPath", "Required absolute UTF-8 output file path. Relative paths are rejected.", true)
         .with_object_param("processing", "Image processing pipeline", processing_properties, true)
         .with_boolean_param("returnBase64", "Return output image base64", false)
         .with_read_only_hint(false)
+        .build();
+}
+
+mcp::tool build_edit_image_tool() {
+    Json processing_properties = shared_processing_properties();
+
+    return mcp::tool_builder("edit_image")
+        .with_description("Edit an existing image through the environment-configured OpenAI-compatible image edit endpoint. Input can come from a cached generate_image/edit_image jobId, an absolute UTF-8 inputPath, or inputBase64. Output defaults to in-memory review; saving requires an explicit absolute UTF-8 outputPath. Native alpha-capable PNG output is controlled by nativeTransparency/output_format parameters, not prompt wording.")
+        .with_string_param("prompt", "Edit instruction prompt", true)
+        .with_string_param("model", "Image model override for this request", false)
+        .with_string_param("sourceJobId", "Cached source jobId returned by generate_image or edit_image", false)
+        .with_number_param("sourceIndex", "Cached source image index, default 0", false)
+        .with_string_param("inputPath", "Absolute UTF-8 input image file path. Relative paths are rejected.", false)
+        .with_string_param("inputBase64", "Input image base64", false)
+        .with_string_param("inputMimeType", "MIME type for inputBase64, default image/png", false)
+        .with_string_param("size", "Optional provider image size. Defaults to 1024x1024 because some gateways reject 512x512; use post-processing to downsample.", false)
+        .with_number_param("n", "Number of edited images, 1-4", false)
+        .with_string_param("quality", "Provider quality option", false)
+        .with_boolean_param("nativeTransparency", "Request alpha-capable PNG output through provider parameters. Do not rely on prompt wording alone for transparency/semi-transparency.", false)
+        .with_object_param("extra", "Extra provider JSON fields, excluding connection config. Use this for provider-specific edit parameters.", Json::object(), false)
+        .with_object_param("processing", "Optional image processing pipeline", processing_properties, false)
+        .with_boolean_param("returnBase64", "Return image base64 in metadata. Defaults to true for in-memory review.", false)
+        .with_boolean_param("saveToFile", "Save image files only when an explicit absolute UTF-8 outputPath is provided. Defaults to false.", false)
+        .with_string_param("outputPath", "Required absolute UTF-8 output file path/name when saveToFile=true. Relative paths are rejected. For multiple images, an index is appended before the extension.", false)
+        .with_boolean_param("selfReviewHint", "Return a visual self-review prompt and base64 payload. Defaults to true.", false)
+        .with_number_param("timeoutSeconds", "Per-request timeout seconds, default 400", false)
+        .with_open_world_hint(true)
         .build();
 }
 
@@ -180,9 +336,8 @@ std::string minecraft_asset_prompt(const std::string& user_prompt) {
     return user_prompt
         + "\n\nStrict Minecraft asset rules: generate exactly ONE standalone game asset in this image. "
           "Do not create a spritesheet, grid, collage, collection, multiple items, hands, characters, labels, text, watermark, or UI. "
-          "Use a clean source composition that can be downsampled to Minecraft texture sizes; prefer 32x32 for balanced item textures, 16x16 for vanilla-like/simple assets, and reserve 64x64/128x128 for high-complexity assets only. "
-          "Do not draw checkerboard transparency, grey grid backgrounds, colored blocks, or fake transparent tiles. "
-          "Do not describe semi-transparency as a visual prompt-only requirement; native alpha/semi-transparency must be requested through tool/provider parameters. "
+          "Use a clean isolated source composition without preview boards, background patterns, decorative tiles, or material swatches. "
+          "Use a composition that can be downsampled to Minecraft texture sizes; prefer 32x32 for balanced item textures, 16x16 for vanilla-like/simple assets, and reserve 64x64/128x128 for high-complexity assets only. "
           "Keep a clean readable silhouette, centered object, crisp pixel-art edges, and low-noise colors.";
 }
 
@@ -203,6 +358,7 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
     metadata["jobId"] = job_id;
     metadata["provider"] = config.protocol;
     metadata["model"] = request.model;
+    metadata["nativeTransparency"] = request.native_transparency;
     metadata["images"] = Json::array();
 
     std::vector<CachedImage> cache_entry;
@@ -217,21 +373,20 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
         image_meta["bytes"] = image.bytes.size();
 
         if (save_to_file) {
-            std::filesystem::path output_path;
-            if (const auto requested_output = string_param(params, "outputPath")) {
-                output_path = std::filesystem::path(*requested_output);
-                if (generated.images.size() > 1) {
-                    const std::filesystem::path parent = output_path.parent_path();
-                    const std::string stem = output_path.stem().string();
-                    const std::string ext = output_path.has_extension() ? output_path.extension().string() : extension_from_mime(image.mime_type);
-                    output_path = parent / (stem + "-" + std::to_string(index) + ext);
-                }
-            } else {
-                output_path = std::filesystem::path(config.output_dir) /
-                    ("mcdk-image-" + job_id + "-" + std::to_string(index) + extension_from_mime(image.mime_type));
+            const auto requested_output = string_param(params, "outputPath");
+            if (!requested_output) {
+                throw mcp::mcp_exception(
+                    mcp::error_code::invalid_params,
+                    "outputPath is required when saveToFile=true; it must be an absolute UTF-8 file path"
+                );
             }
-            write_binary_file(output_path.string(), image.bytes);
-            image_meta["filePath"] = output_path.generic_string();
+
+            std::filesystem::path output_path = require_absolute_utf8_path(*requested_output, "outputPath");
+            if (generated.images.size() > 1) {
+                output_path = indexed_output_path(output_path, index, image.mime_type);
+            }
+            write_binary_file(path_to_utf8_string(output_path), image.bytes);
+            image_meta["filePath"] = path_to_utf8_string(output_path);
         }
 
         if (return_base64 || self_review_hint) {
@@ -288,30 +443,24 @@ Json handle_save_cached_image(const Json& params, const AppConfig& config) {
         throw mcp::mcp_exception(mcp::error_code::invalid_params, "index must be >= 0");
     }
 
-    CachedImage cached;
-    {
-        std::lock_guard<std::mutex> lock(image_cache_mutex());
-        auto job_it = image_cache().find(*job_id);
-        if (job_it == image_cache().end()) {
-            throw mcp::mcp_exception(mcp::error_code::invalid_params, "cached jobId not found or MCP process was restarted");
-        }
-        if (static_cast<std::size_t>(image_index) >= job_it->second.size()) {
-            throw mcp::mcp_exception(mcp::error_code::invalid_params, "cached image index out of range");
-        }
-        cached = job_it->second[static_cast<std::size_t>(image_index)];
-    }
+    CachedImage cached = get_cached_image(*job_id, image_index);
 
-    const std::string output_path = string_param(params, "outputPath").value_or(
-        (std::filesystem::path(config.output_dir) / ("mcdk-image-" + *job_id + "-" + std::to_string(image_index) + extension_from_mime(cached.mime_type))).string()
-    );
-    write_binary_file(output_path, cached.bytes);
+    const auto requested_output = string_param(params, "outputPath");
+    if (!requested_output) {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            "outputPath is required; it must be an absolute UTF-8 file path"
+        );
+    }
+    std::filesystem::path output_path = require_absolute_utf8_path(*requested_output, "outputPath");
+    write_binary_file(path_to_utf8_string(output_path), cached.bytes);
 
     Json metadata = {
         {"jobId", *job_id},
         {"index", image_index},
         {"mimeType", cached.mime_type},
         {"bytes", cached.bytes.size()},
-        {"filePath", std::filesystem::path(output_path).generic_string()},
+        {"filePath", path_to_utf8_string(output_path)},
         {"reusedCachedImage", true}
     };
 
@@ -328,7 +477,9 @@ Json handle_process_image(const Json& params, const AppConfig& config) {
 
     ImageData input;
     input.mime_type = "image/png";
-    input.bytes = input_path ? read_binary_file(*input_path) : base64_decode_bytes(*input_base64);
+    input.bytes = input_path
+        ? read_binary_file(path_to_utf8_string(require_absolute_utf8_path(*input_path, "inputPath")))
+        : base64_decode_bytes(*input_base64);
 
     ImageProcessingOptions processing = parse_processing_options(params);
     processing.enabled = true;
@@ -338,17 +489,115 @@ Json handle_process_image(const Json& params, const AppConfig& config) {
     metadata["mimeType"] = output.mime_type;
     metadata["bytes"] = output.bytes.size();
 
-    const std::string output_path = string_param(params, "outputPath").value_or(
-        (std::filesystem::path(config.output_dir) / ("processed-" + make_job_id() + ".png")).string()
-    );
-    write_binary_file(output_path, output.bytes);
-    metadata["filePath"] = std::filesystem::path(output_path).generic_string();
+    const auto requested_output = string_param(params, "outputPath");
+    if (!requested_output) {
+        throw mcp::mcp_exception(
+            mcp::error_code::invalid_params,
+            "outputPath is required; it must be an absolute UTF-8 file path"
+        );
+    }
+    std::filesystem::path output_path = require_absolute_utf8_path(*requested_output, "outputPath");
+    write_binary_file(path_to_utf8_string(output_path), output.bytes);
+    metadata["filePath"] = path_to_utf8_string(output_path);
 
     if (return_base64) {
         metadata["base64"] = base64_encode_bytes(output.bytes);
     }
 
     return tool_content_with_metadata("图像处理完成。", metadata);
+}
+
+Json handle_edit_image(const Json& params, const AppConfig& config) {
+    const auto started = std::chrono::steady_clock::now();
+    const std::string job_id = make_job_id();
+    const bool return_base64 = bool_param(params, "returnBase64", true);
+    const bool save_to_file = bool_param(params, "saveToFile", false);
+    const bool self_review_hint = bool_param(params, "selfReviewHint", true);
+
+    OpenAIImageProvider provider(config);
+    ImageEditRequest request = parse_edit_request(params, config);
+    request.prompt = minecraft_asset_prompt(request.prompt);
+    ImageProcessingOptions processing = parse_processing_options(params);
+    ImageGenerationResult edited = provider.edit(request);
+
+    Json metadata = Json::object();
+    metadata["jobId"] = job_id;
+    metadata["provider"] = config.protocol;
+    metadata["model"] = request.model;
+    metadata["nativeTransparency"] = request.native_transparency;
+    metadata["inputImageCount"] = request.input_images.size();
+    metadata["images"] = Json::array();
+
+    std::vector<CachedImage> cache_entry;
+
+    std::size_t index = 0;
+    for (const ImageData& source_image : edited.images) {
+        ImageData image = process_image_data(source_image, processing);
+        cache_entry.push_back(CachedImage{image.mime_type, image.bytes});
+        Json image_meta = Json::object();
+        image_meta["index"] = index;
+        image_meta["mimeType"] = image.mime_type;
+        image_meta["bytes"] = image.bytes.size();
+
+        if (save_to_file) {
+            const auto requested_output = string_param(params, "outputPath");
+            if (!requested_output) {
+                throw mcp::mcp_exception(
+                    mcp::error_code::invalid_params,
+                    "outputPath is required when saveToFile=true; it must be an absolute UTF-8 file path"
+                );
+            }
+
+            std::filesystem::path output_path = require_absolute_utf8_path(*requested_output, "outputPath");
+            if (edited.images.size() > 1) {
+                output_path = indexed_output_path(output_path, index, image.mime_type);
+            }
+            write_binary_file(path_to_utf8_string(output_path), image.bytes);
+            image_meta["filePath"] = path_to_utf8_string(output_path);
+        }
+
+        if (return_base64 || self_review_hint) {
+            image_meta["base64"] = base64_encode_bytes(image.bytes);
+        }
+
+        image_meta["processing"] = {
+            {"enabled", processing.enabled},
+            {"nearestResizeApplied", processing.enabled && processing.nearest_resize_enabled},
+            {"transparentDomainScaleApplied", processing.enabled && processing.transparent_domain_scale_enabled},
+            {"pixelArtCompressApplied", processing.enabled && processing.pixel_art_compress_enabled},
+            {"removeFakeTransparencyApplied", processing.enabled && processing.remove_fake_transparency_enabled}
+        };
+        metadata["images"].push_back(std::move(image_meta));
+        ++index;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(image_cache_mutex());
+        image_cache()[job_id] = std::move(cache_entry);
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    metadata["elapsedMs"] = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    if (self_review_hint && !metadata["images"].empty() && metadata["images"][0].contains("base64")) {
+        metadata["selfReview"] = {
+            {"enabled", true},
+            {"prompt", "请作为 Minecraft 美术审查员，检查二次编辑后的图是否满足：1）仍然只有一个独立素材，不是四宫格/合集/spritesheet；2）如需要透明/半透明，必须来自原生 alpha/provider 参数，而不是画出来的棋盘格、有色色块或提示词伪透明；3）优先检查 32x32 下是否轮廓清晰，简单/原版风素材再检查 16x16，只有高复杂度素材才建议 64x64/128x128；4）低噪声、主体居中、适合作为游戏贴图。确认后可调用 save_cached_image 保存该 edit_image 返回的 jobId。"},
+            {"image", {
+                {"mimeType", metadata["images"][0]["mimeType"]},
+                {"base64", metadata["images"][0]["base64"]}
+            }}
+        };
+    }
+
+    metadata["workflow"] = {
+        {"editedFromExistingImage", true},
+        {"inMemoryReviewFirst", true},
+        {"savedToFile", save_to_file},
+        {"finalizeInstruction", "默认仅返回 base64 供 LLM 自审，并将编辑结果缓存在当前 MCP 进程内；确认素材完美后，调用 save_cached_image(jobId,index) 直接保存缓存图，避免重新编辑。"}
+    };
+
+    return tool_content_with_metadata("编辑完成：" + std::to_string(metadata["images"].size()) + " 张图像，默认以内存 base64 形式供自审，并已缓存可供 save_cached_image 直接保存。", metadata);
 }
 
 } // namespace
@@ -364,6 +613,10 @@ void register_image_tools(mcp::server& server, const AppConfig& config) {
 
     server.register_tool(build_process_image_tool(), [config](const mcp::json& params, const std::string&) {
         return handle_process_image(params, config);
+    });
+
+    server.register_tool(build_edit_image_tool(), [config](const mcp::json& params, const std::string&) {
+        return handle_edit_image(params, config);
     });
 }
 

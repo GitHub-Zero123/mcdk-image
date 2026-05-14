@@ -36,6 +36,23 @@ std::string detect_mime_type(const std::vector<std::uint8_t>& bytes, const std::
     return fallback;
 }
 
+void merge_extra_fields(Json& payload, const Json& extra) {
+    if (!extra.is_object()) {
+        return;
+    }
+
+    for (const auto& item : extra.items()) {
+        // Explicit extra fields are allowed to override defaults for
+        // OpenAI-compatible gateways with different parameter names.
+        payload[item.key()] = item.value();
+    }
+}
+
+std::string data_url_from_image(const ImageData& image) {
+    const std::string encoded = base64::encode(reinterpret_cast<const char*>(image.bytes.data()), image.bytes.size());
+    return "data:" + (image.mime_type.empty() ? std::string("image/png") : image.mime_type) + ";base64," + encoded;
+}
+
 Json build_openai_payload(const ImageGenerationRequest& request) {
     Json payload = Json::object();
     payload["model"] = request.model;
@@ -53,18 +70,41 @@ Json build_openai_payload(const ImageGenerationRequest& request) {
         payload["style"] = *request.style;
     }
     if (request.native_transparency) {
-        payload["background"] = "transparent";
+        // For gpt-image-1-style APIs, PNG output is the documented switch that
+        // enables alpha-capable output. Some gateways turn background fields
+        // into an opaque white compatibility path, so do not inject them by default.
         payload["output_format"] = "png";
-        payload["response_format"] = "b64_json";
     }
 
-    if (request.extra.is_object()) {
-        for (const auto& item : request.extra.items()) {
-            // Explicit extra fields are allowed to override defaults for
-            // OpenAI-compatible gateways with different parameter names.
-            payload[item.key()] = item.value();
-        }
+    merge_extra_fields(payload, request.extra);
+    return payload;
+}
+
+Json build_openai_edit_payload(const ImageEditRequest& request) {
+    Json payload = Json::object();
+    payload["model"] = request.model;
+    payload["prompt"] = request.prompt;
+    payload["image"] = Json::array();
+    for (const ImageData& image : request.input_images) {
+        payload["image"].push_back({
+            {"type", "input_image"},
+            {"image_url", data_url_from_image(image)}
+        });
     }
+    if (request.n && *request.n > 0) {
+        payload["n"] = *request.n;
+    }
+    if (request.size && !request.size->empty()) {
+        payload["size"] = *request.size;
+    }
+    if (request.quality && !request.quality->empty()) {
+        payload["quality"] = *request.quality;
+    }
+    if (request.native_transparency) {
+        payload["output_format"] = "png";
+    }
+
+    merge_extra_fields(payload, request.extra);
     return payload;
 }
 
@@ -81,33 +121,17 @@ std::string OpenAIImageProvider::generations_url() const {
     return base + "/v1/images/generations";
 }
 
-ImageGenerationResult OpenAIImageProvider::generate(const ImageGenerationRequest& request) {
-    HttpClient http(request.timeout_seconds > 0 ? request.timeout_seconds : config_.timeout_seconds);
-    Json payload = build_openai_payload(request);
+std::string OpenAIImageProvider::edits_url() const {
+    const std::string base = trim_trailing_slashes(config_.base_url);
+    if (base.size() >= 3 && base.compare(base.size() - 3, 3, "/v1") == 0) {
+        return base + "/images/edits";
+    }
+    return base + "/v1/images/edits";
+}
 
-    const std::map<std::string, std::string> headers = {
-        {"Authorization", "Bearer " + config_.api_key},
-        {"Accept", "application/json"}
-    };
-
-    HttpResponse response = http.post_json(generations_url(), headers, payload.dump());
+ImageGenerationResult parse_image_response(const HttpClient& http, const HttpResponse& response) {
     if (response.status == 0) {
         throw std::runtime_error("network_error: " + response.error);
-    }
-    if ((response.status == 400 || response.status == 502) && request.native_transparency && payload.contains("background")) {
-        // Some OpenAI-compatible gateways reject or misroute native transparent
-        // background fields. Fall back once to prompt/image-only behavior.
-        payload.erase("background");
-        payload.erase("output_format");
-        payload.erase("response_format");
-        response = http.post_json(generations_url(), headers, payload.dump());
-    }
-    if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
-        // Some gateways expose image models that only accept their default/native
-        // size or 1024x1024. If a smaller requested size causes an upstream 502,
-        // retry once with 1024x1024 and let the local post-process pipeline shrink it.
-        payload["size"] = "1024x1024";
-        response = http.post_json(generations_url(), headers, payload.dump());
     }
     if (response.status < 200 || response.status >= 300) {
         throw std::runtime_error("provider_error: HTTP " + std::to_string(response.status) + ": " + response.body);
@@ -154,6 +178,43 @@ ImageGenerationResult OpenAIImageProvider::generate(const ImageGenerationRequest
     }
 
     return result;
+}
+
+ImageGenerationResult OpenAIImageProvider::generate(const ImageGenerationRequest& request) {
+    HttpClient http(request.timeout_seconds > 0 ? request.timeout_seconds : config_.timeout_seconds);
+    Json payload = build_openai_payload(request);
+
+    const std::map<std::string, std::string> headers = {
+        {"Authorization", "Bearer " + config_.api_key},
+        {"Accept", "application/json"}
+    };
+
+    HttpResponse response = http.post_json(generations_url(), headers, payload.dump());
+    if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
+        // Some gateways expose image models that only accept their default/native
+        // size or 1024x1024. If a smaller requested size causes an upstream 502,
+        // retry once with 1024x1024 and let the local post-process pipeline shrink it.
+        payload["size"] = "1024x1024";
+        response = http.post_json(generations_url(), headers, payload.dump());
+    }
+    return parse_image_response(http, response);
+}
+
+ImageGenerationResult OpenAIImageProvider::edit(const ImageEditRequest& request) {
+    HttpClient http(request.timeout_seconds > 0 ? request.timeout_seconds : config_.timeout_seconds);
+    Json payload = build_openai_edit_payload(request);
+
+    const std::map<std::string, std::string> headers = {
+        {"Authorization", "Bearer " + config_.api_key},
+        {"Accept", "application/json"}
+    };
+
+    HttpResponse response = http.post_json(edits_url(), headers, payload.dump());
+    if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
+        payload["size"] = "1024x1024";
+        response = http.post_json(edits_url(), headers, payload.dump());
+    }
+    return parse_image_response(http, response);
 }
 
 } // namespace mcdk::image

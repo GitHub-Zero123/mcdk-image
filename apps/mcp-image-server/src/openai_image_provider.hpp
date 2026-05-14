@@ -31,6 +31,18 @@ struct ImageGenerationRequest {
     int timeout_seconds = 400;
 };
 
+struct ImageEditRequest {
+    std::string prompt;
+    std::string model;
+    std::vector<ImageData> input_images;
+    std::optional<std::string> size;
+    std::optional<int> n;
+    std::optional<std::string> quality;
+    Json extra = Json::object();
+    bool native_transparency = false;
+    int timeout_seconds = 400;
+};
+
 struct ImageGenerationResult {
     std::vector<ImageData> images;
     Json raw_response = Json::object();
@@ -47,11 +59,13 @@ public:
     explicit OpenAIImageProvider(AppConfig config);
 
     ImageGenerationResult generate(const ImageGenerationRequest& request) override;
+    ImageGenerationResult edit(const ImageEditRequest& request);
 
 private:
     AppConfig config_;
 
     std::string generations_url() const;
+    std::string edits_url() const;
 };
 
 } // namespace mcdk::image

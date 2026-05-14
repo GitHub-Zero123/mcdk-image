@@ -10,7 +10,6 @@ struct AppConfig {
     std::string base_url;
     std::string api_key;
     std::string default_model;
-    std::string output_dir;
     int timeout_seconds = 400;
     std::string log_level;
 };
