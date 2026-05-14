@@ -383,10 +383,21 @@ ImageBuffer remove_chroma_key_background(const ImageBuffer& source, int key_r, i
             const int rr = output.rgba[index + 0];
             const int gg = output.rgba[index + 1];
             const int bb = output.rgba[index + 2];
-            if (spill > 0 && gg > rr && gg > bb) {
+            const int aa = output.rgba[index + 3];
+            const int green_dominance = gg - std::max(rr, bb);
+            const int green_key_similarity = (255 - std::abs(gg - kg)) + green_dominance;
+            if (aa < 96 && green_dominance > 12 && green_key_similarity > 180) {
+                output.rgba[index + 0] = 0;
+                output.rgba[index + 1] = 0;
+                output.rgba[index + 2] = 0;
+                output.rgba[index + 3] = 0;
+                continue;
+            }
+            if (spill > 0 && green_dominance > 0) {
                 const int max_non_green = std::max(rr, bb);
+                const int spill_strength = std::min(spill + (aa < 160 ? 64 : 0), 255);
                 const int excess_green = std::max(0, gg - max_non_green);
-                output.rgba[index + 1] = static_cast<std::uint8_t>(std::max(max_non_green, gg - std::min(excess_green, spill)));
+                output.rgba[index + 1] = static_cast<std::uint8_t>(std::max(max_non_green, gg - std::min(excess_green, spill_strength)));
             }
         }
     }
