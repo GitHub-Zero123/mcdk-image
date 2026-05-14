@@ -91,9 +91,10 @@ ImageGenerationRequest parse_generation_request(const Json& params, const AppCon
     ImageGenerationRequest request;
     request.prompt = params["prompt"].get<std::string>();
     request.model = string_param(params, "model").value_or(config.default_model);
-    request.size = string_param(params, "size");
+    request.size = string_param(params, "size").value_or("1024x1024");
     request.quality = string_param(params, "quality");
     request.style = string_param(params, "style");
+    request.native_transparency = bool_param(params, "nativeTransparency", false);
     request.timeout_seconds = int_param(params, "timeoutSeconds", config.timeout_seconds);
 
     const int n = int_param(params, "n", 1);
@@ -119,24 +120,26 @@ ImageGenerationRequest parse_generation_request(const Json& params, const AppCon
 mcp::tool build_generate_image_tool() {
     Json processing_properties = {
         {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
-        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. Recommended Minecraft pixel-art sizes: 16x16, 32x32, 64x64, 128x128."}}},
+        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
         {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
-        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16, 32x32, 64x64, or 128x128 for game assets."}}},
+        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
         {"removeFakeTransparency", {{"type", "object"}, {"description", "Convert fake checkerboard/solid background colors into real alpha transparency"}}}
     };
 
     return mcp::tool_builder("generate_image")
-        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Default workflow keeps the image in memory and returns base64 for LLM self-review; only save to file when saveToFile=true after review. Prompts should request a single item/entity/block asset, not a grid, collage, spritesheet, or multiple objects. Recommended pixel-art sizes: 16x16, 32x32, 64x64, 128x128.")
+        .with_description("Generate ONE Minecraft game asset per image through the environment-configured OpenAI-compatible image provider. Default generation size is 1024x1024 because some gateways reject 512x512 with upstream errors; post-process down to 32x32 or 16x16 for most Minecraft pixel-art assets. 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets. Default workflow keeps the image in memory and returns base64 for LLM self-review; only save to file when saveToFile=true after review. Prompts should request a single item/entity/block asset, not a grid, collage, spritesheet, or multiple objects. True transparency/semi-transparency should be requested through nativeTransparency or provider extra fields, not only through prompt wording.")
         .with_string_param("prompt", "Image prompt", true)
         .with_string_param("model", "Image model override for this request", false)
-        .with_string_param("size", "Provider image size such as 1024x1024", false)
+        .with_string_param("size", "Optional provider image size. Defaults to 1024x1024 because some gateways reject 512x512; use smaller sizes only when the provider is known to support them.", false)
         .with_number_param("n", "Number of images, 1-4", false)
         .with_string_param("quality", "Provider quality option", false)
         .with_string_param("style", "Provider style option", false)
-        .with_object_param("extra", "Extra provider JSON fields, excluding connection config", Json::object(), false)
+        .with_boolean_param("nativeTransparency", "Request native transparent PNG output through provider parameters. Do not rely on prompt wording alone for transparency/semi-transparency.", false)
+        .with_object_param("extra", "Extra provider JSON fields, excluding connection config. Use this for provider-specific native alpha/transparency controls.", Json::object(), false)
         .with_object_param("processing", "Optional image processing pipeline", processing_properties, false)
         .with_boolean_param("returnBase64", "Return image base64 in metadata. Defaults to true for in-memory review.", false)
         .with_boolean_param("saveToFile", "Save image files to output directory. Defaults to false; enable only after self-review accepts the asset.", false)
+        .with_string_param("outputPath", "Optional output file path/name when saveToFile=true. For multiple images, an index is appended before the extension.", false)
         .with_boolean_param("selfReviewHint", "Return a visual self-review prompt and base64 payload. Defaults to true.", false)
         .with_number_param("timeoutSeconds", "Per-request timeout seconds, default 400", false)
         .with_open_world_hint(true)
@@ -156,9 +159,9 @@ mcp::tool build_save_cached_image_tool() {
 mcp::tool build_process_image_tool() {
     Json processing_properties = {
         {"enabled", {{"type", "boolean"}, {"description", "Enable post-processing pipeline"}}},
-        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. Recommended Minecraft pixel-art sizes: 16x16, 32x32, 64x64, 128x128."}}},
+        {"nearestResize", {{"type", "object"}, {"description", "Nearest-neighbor resize options. For Minecraft pixel art, prefer 16x16 or 32x32; 32x32 is usually the most balanced. Use 64x64/128x128 only for high-complexity assets."}}},
         {"transparentDomainScale", {{"type", "object"}, {"description", "Crop transparent domain and resize options"}}},
-        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16, 32x32, 64x64, or 128x128 for game assets."}}},
+        {"pixelArtCompress", {{"type", "object"}, {"description", "Pixel-art compression options. Prefer 16x16 or 32x32 for most Minecraft assets; 32x32 is the most balanced. Use 64x64/128x128 only when detail complexity requires it."}}},
         {"removeFakeTransparency", {{"type", "object"}, {"description", "Convert fake checkerboard/solid background colors into real alpha transparency"}}}
     };
 
@@ -177,8 +180,9 @@ std::string minecraft_asset_prompt(const std::string& user_prompt) {
     return user_prompt
         + "\n\nStrict Minecraft asset rules: generate exactly ONE standalone game asset in this image. "
           "Do not create a spritesheet, grid, collage, collection, multiple items, hands, characters, labels, text, watermark, or UI. "
-          "The asset should be suitable for Minecraft texture development at 16x16, 32x32, 64x64, or 128x128 scale. "
-          "Use true transparent background/alpha if supported; do not draw checkerboard transparency, grey grid backgrounds, colored blocks, or fake transparent tiles. "
+          "Use a clean source composition that can be downsampled to Minecraft texture sizes; prefer 32x32 for balanced item textures, 16x16 for vanilla-like/simple assets, and reserve 64x64/128x128 for high-complexity assets only. "
+          "Do not draw checkerboard transparency, grey grid backgrounds, colored blocks, or fake transparent tiles. "
+          "Do not describe semi-transparency as a visual prompt-only requirement; native alpha/semi-transparency must be requested through tool/provider parameters. "
           "Keep a clean readable silhouette, centered object, crisp pixel-art edges, and low-noise colors.";
 }
 
@@ -213,8 +217,19 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
         image_meta["bytes"] = image.bytes.size();
 
         if (save_to_file) {
-            std::filesystem::path output_path = std::filesystem::path(config.output_dir) /
-                ("mcdk-image-" + job_id + "-" + std::to_string(index) + extension_from_mime(image.mime_type));
+            std::filesystem::path output_path;
+            if (const auto requested_output = string_param(params, "outputPath")) {
+                output_path = std::filesystem::path(*requested_output);
+                if (generated.images.size() > 1) {
+                    const std::filesystem::path parent = output_path.parent_path();
+                    const std::string stem = output_path.stem().string();
+                    const std::string ext = output_path.has_extension() ? output_path.extension().string() : extension_from_mime(image.mime_type);
+                    output_path = parent / (stem + "-" + std::to_string(index) + ext);
+                }
+            } else {
+                output_path = std::filesystem::path(config.output_dir) /
+                    ("mcdk-image-" + job_id + "-" + std::to_string(index) + extension_from_mime(image.mime_type));
+            }
             write_binary_file(output_path.string(), image.bytes);
             image_meta["filePath"] = output_path.generic_string();
         }
@@ -245,7 +260,7 @@ Json handle_generate_image(const Json& params, const AppConfig& config) {
     if (self_review_hint && !metadata["images"].empty() && metadata["images"][0].contains("base64")) {
         metadata["selfReview"] = {
             {"enabled", true},
-            {"prompt", "请作为 Minecraft 美术审查员，检查该图是否满足：1）只有一个独立素材，不是四宫格/合集/spritesheet；2）背景是真透明 alpha，不是棋盘格或有色色块伪透明；3）在 16x16/32x32/64x64/128x128 下轮廓清晰；4）低噪声、主体居中、适合作为游戏贴图。若不满足，请输出下一轮改进 prompt；只有确认完美后才建议调用 saveToFile=true 落盘。"},
+            {"prompt", "请作为 Minecraft 美术审查员，检查该图是否满足：1）只有一个独立素材，不是四宫格/合集/spritesheet；2）如需要透明/半透明，必须来自原生 alpha/provider 参数，而不是画出来的棋盘格、有色色块或提示词伪透明；3）优先检查 32x32 下是否轮廓清晰，简单/原版风素材再检查 16x16，只有高复杂度素材才建议 64x64/128x128；4）低噪声、主体居中、适合作为游戏贴图。若不满足，请输出下一轮改进建议；若问题是透明/半透明，请建议启用 nativeTransparency 或 provider extra 字段，而不是仅修改提示词；只有确认完美后才建议调用 save_cached_image 落盘。"},
             {"image", {
                 {"mimeType", metadata["images"][0]["mimeType"]},
                 {"base64", metadata["images"][0]["base64"]}

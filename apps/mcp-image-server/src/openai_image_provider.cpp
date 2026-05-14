@@ -52,11 +52,17 @@ Json build_openai_payload(const ImageGenerationRequest& request) {
     if (request.style && !request.style->empty()) {
         payload["style"] = *request.style;
     }
+    if (request.native_transparency) {
+        payload["background"] = "transparent";
+        payload["output_format"] = "png";
+        payload["response_format"] = "b64_json";
+    }
+
     if (request.extra.is_object()) {
         for (const auto& item : request.extra.items()) {
-            if (!payload.contains(item.key())) {
-                payload[item.key()] = item.value();
-            }
+            // Explicit extra fields are allowed to override defaults for
+            // OpenAI-compatible gateways with different parameter names.
+            payload[item.key()] = item.value();
         }
     }
     return payload;
@@ -77,16 +83,31 @@ std::string OpenAIImageProvider::generations_url() const {
 
 ImageGenerationResult OpenAIImageProvider::generate(const ImageGenerationRequest& request) {
     HttpClient http(request.timeout_seconds > 0 ? request.timeout_seconds : config_.timeout_seconds);
-    const Json payload = build_openai_payload(request);
+    Json payload = build_openai_payload(request);
 
     const std::map<std::string, std::string> headers = {
         {"Authorization", "Bearer " + config_.api_key},
         {"Accept", "application/json"}
     };
 
-    const HttpResponse response = http.post_json(generations_url(), headers, payload.dump());
+    HttpResponse response = http.post_json(generations_url(), headers, payload.dump());
     if (response.status == 0) {
         throw std::runtime_error("network_error: " + response.error);
+    }
+    if ((response.status == 400 || response.status == 502) && request.native_transparency && payload.contains("background")) {
+        // Some OpenAI-compatible gateways reject or misroute native transparent
+        // background fields. Fall back once to prompt/image-only behavior.
+        payload.erase("background");
+        payload.erase("output_format");
+        payload.erase("response_format");
+        response = http.post_json(generations_url(), headers, payload.dump());
+    }
+    if (response.status == 502 && payload.contains("size") && payload["size"].is_string() && payload["size"] != "1024x1024") {
+        // Some gateways expose image models that only accept their default/native
+        // size or 1024x1024. If a smaller requested size causes an upstream 502,
+        // retry once with 1024x1024 and let the local post-process pipeline shrink it.
+        payload["size"] = "1024x1024";
+        response = http.post_json(generations_url(), headers, payload.dump());
     }
     if (response.status < 200 || response.status >= 300) {
         throw std::runtime_error("provider_error: HTTP " + std::to_string(response.status) + ": " + response.body);

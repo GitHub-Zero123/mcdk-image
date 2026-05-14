@@ -27,6 +27,7 @@ struct ImageGenerationRequest {
     std::optional<std::string> quality;
     std::optional<std::string> style;
     Json extra = Json::object();
+    bool native_transparency = false;
     int timeout_seconds = 400;
 };
 
