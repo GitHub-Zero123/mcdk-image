@@ -23,6 +23,8 @@ target_include_directories(nlohmann_json INTERFACE
 
 find_package(Threads REQUIRED)
 
+option(MCDK_IMAGE_REQUIRE_VULKAN "Require Vulkan SDK/glslc for the local stable-diffusion.cpp backend" ON)
+
 add_subdirectory(libs/cpp-mcp)
 target_link_libraries(mcp PUBLIC nlohmann_json::nlohmann_json)
 
@@ -34,6 +36,8 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/stable-diffusion/CMakeLists.txt" AND
     if(Vulkan_FOUND AND Vulkan_glslc_FOUND)
         set(SD_VULKAN ON CACHE BOOL "sd: vulkan backend" FORCE)
         set(GGML_VULKAN ON CACHE BOOL "ggml: enable Vulkan backend" FORCE)
+    elseif(MCDK_IMAGE_REQUIRE_VULKAN)
+        message(FATAL_ERROR "Vulkan SDK/glslc was not found, but MCDK_IMAGE_REQUIRE_VULKAN=ON. Install LunarG Vulkan SDK and reconfigure, or set -DMCDK_IMAGE_REQUIRE_VULKAN=OFF for CPU-only development builds.")
     else()
         message(WARNING "Vulkan SDK/glslc was not found; building stable-diffusion.cpp with CPU backend only. Install Vulkan SDK to enable Vulkan acceleration.")
         set(SD_VULKAN OFF CACHE BOOL "sd: vulkan backend" FORCE)

@@ -7,6 +7,7 @@
 #include <locale>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -717,6 +718,10 @@ ggml_backend_t sd_get_default_backend() {
             }
         }
     });
+
+    const char* MCDK_BACKEND = getenv("MCDK_IMAGE_SDCPP_BACKEND");
+    const bool vulkan_only = MCDK_BACKEND != nullptr && std::string(MCDK_BACKEND) == "vulkan";
+
     ggml_backend_t backend   = nullptr;
     const char* SD_VK_DEVICE = getenv("SD_VK_DEVICE");
     if (SD_VK_DEVICE != nullptr) {
@@ -728,15 +733,44 @@ ggml_backend_t sd_get_default_backend() {
                 LOG_INFO("Selecting %s as main device by env var SD_VK_DEVICE", vk_device_name.c_str());
                 backend = init_named_backend(vk_device_name);
                 if (!backend) {
+                    if (vulkan_only) {
+                        throw std::runtime_error("Vulkan-only backend requested, but requested SD_VK_DEVICE failed to initialize: " + vk_device_name);
+                    }
                     LOG_WARN("Device %s requested by SD_VK_DEVICE failed to init. Falling back to the default device.", vk_device_name.c_str());
                 }
             } else {
+                if (vulkan_only) {
+                    throw std::runtime_error("Vulkan-only backend requested, but requested SD_VK_DEVICE was not found: " + vk_device_name);
+                }
                 LOG_WARN("Device %s requested by SD_VK_DEVICE was not found. Falling back to the default device.", vk_device_name.c_str());
             }
         } catch (const std::invalid_argument&) {
+            if (vulkan_only) {
+                throw std::runtime_error("Vulkan-only backend requested, but SD_VK_DEVICE is not a valid integer");
+            }
             LOG_WARN("SD_VK_DEVICE environment variable is not a valid integer (%s). Falling back to the default device.", SD_VK_DEVICE);
         } catch (const std::out_of_range&) {
+            if (vulkan_only) {
+                throw std::runtime_error("Vulkan-only backend requested, but SD_VK_DEVICE is out of range");
+            }
             LOG_WARN("SD_VK_DEVICE environment variable value is out of range for `unsigned long long` type (%s). Falling back to the default device.", SD_VK_DEVICE);
+        }
+    }
+
+    if (!backend && vulkan_only) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            std::string dev_name = ggml_backend_dev_name(dev);
+            if (dev_name.find("Vulkan") != std::string::npos) {
+                LOG_INFO("Selecting %s as main device by MCDK_IMAGE_SDCPP_BACKEND=vulkan", dev_name.c_str());
+                backend = init_named_backend(dev_name);
+                if (backend) {
+                    break;
+                }
+            }
+        }
+        if (!backend) {
+            throw std::runtime_error("Vulkan-only backend requested, but no Vulkan backend device is available. Rebuild with GGML_VULKAN=ON and install Vulkan runtime/driver.");
         }
     }
 
