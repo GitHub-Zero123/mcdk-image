@@ -66,7 +66,11 @@ Json build_openai_payload(const ImageGenerationRequest& request) {
     if (request.quality && !request.quality->empty()) {
         payload["quality"] = *request.quality;
     }
-    if (request.style && !request.style->empty()) {
+    // quality and style are both provider/model-specific image options. The
+    // current gateway accepts either one alone, but rejects the combination.
+    // Prefer quality when both are supplied because it maps to the newer image
+    // model option family; style can still be forced explicitly through extra.
+    if ((!request.quality || request.quality->empty()) && request.style && !request.style->empty()) {
         payload["style"] = *request.style;
     }
     if (request.native_transparency) {
